@@ -1,0 +1,94 @@
+[plugin]
+# 是否启用插件
+enabled = true
+# 配置版本
+config_version = "1.1.0"
+# 是否让 fetch_url 始终对 Planner 可见（无需 tool_search 发现）。修改后需重新加载插件才能生效
+always_visible_for_planner = false
+
+[fetch]
+# 直接抓取 URL 的 HTTP 超时时间（秒）
+timeout = 15.0
+# 抓取内容时使用的代理地址（例如 "http://127.0.0.1:7890"）；留空表示不使用代理
+proxy = ""
+# 抓取时使用的 User-Agent
+user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+# 单次下载的最大字节数（默认 16 MB），超过即中止并报错
+max_download_size = 16777216
+# 是否允许抓取内网 / 环回 / 保留地址。默认关闭（SSRF 防护），仅在确有需要时开启
+allow_private_networks = false
+# 对所有域名发送的全局 Cookie 字符串（例如 "key1=value1; key2=value2"）。请勿提交到版本库
+cookies = ""
+
+# 按域名配置的 Cookie：键为域名（匹配自身及子域名），值为 Cookie 字符串。
+# 直接抓取时通过 Cookie 头发送，jina 抓取时通过 X-Set-Cookie 转发。请勿提交到版本库。
+# 示例：
+#   "example.com" = "session=xxx; token=yyy"
+[fetch.domain_cookies]
+
+[jina]
+# 是否优先使用 jina.ai Reader 抓取非图片内容（支持网页 / PDF，质量更好）
+enabled = true
+# jina.ai API Key（可选）。不填也能用但有更严格的频率限制。请勿提交到版本库
+api_key = ""
+# jina.ai 请求超时时间（秒）。超时视为提供方故障，自动回退到本地 markdownify 抓取
+timeout = 30.0
+# jina.ai 渲染引擎（X-Engine 头），browser 渲染质量最好；留空表示由 jina 自动选择
+engine = "browser"
+# 是否在配置了 jina API Key 时让 jina 为缺失 alt 的图片生成描述（X-With-Generated-Alt 头）
+# 未配置 API Key 时不会发送该头（jina 对该功能要求认证）
+with_generated_alt = true
+
+[image]
+# 可直接回传的图片格式列表；不在列表内的格式会转换为 convert_format
+acceptable_formats = ["jpeg", "png", "gif", "webp"]
+# 转换目标格式，可选 webp / jpeg / png / gif
+convert_format = "webp"
+# 回传图片的最大字节数（默认 2 MB），超过会触发压缩
+max_image_size = 2097152
+# 压缩时的最长边上限（像素）；超大图会先缩到该尺寸再做质量搜索
+max_dimension = 2048
+# webp / jpeg 压缩的初始质量
+quality_start = 80
+# webp / jpeg 压缩的最低质量；到达下限仍超标时改为缩小图片尺寸
+quality_floor = 10
+
+[content]
+# 单次返回文本内容的最大字符数；超过时按 llm_summarize 设置进行总结或截断
+max_content_length = 8000
+# 超长内容是否默认调用 LLM 总结；关闭后超长内容一律截断
+llm_summarize = true
+
+[llm]
+# 总结时使用的 LLM 模型任务名（planner / replyer 等 Host 任务名，不是原始模型 ID）
+model = "planner"
+# 总结时的采样温度
+temperature = 0.3
+# 总结 LLM 调用的最大 token 数；0 表示自动按 max_content_length 的四倍计算
+# 若小于 max_content_length 会在日志中告警，输出可能被截断
+max_tokens = 0
+# 总结提示词模板。占位符：{nickname}、{personality}、{reply_style}、{url}、
+# {total}、{max_length}、{focus_section}、{content}
+summarize_prompt_template = """你是{nickname}。
+你的人格设定：{personality}
+你的表达风格：{reply_style}
+
+你刚刚通过 fetch_url 工具抓取了 {url} 的内容，但内容太长了：当前 {total} 字符，需要压缩到 {max_length} 字符以内。
+请将下面的内容总结成一份不超过 {max_length} 字符的摘要，尽量保留关键信息、数据、结论与重要链接。{focus_section}
+只输出摘要正文本身，不要输出任何解释、前言或额外说明。
+
+抓取到的内容：
+{content}"""
+
+[alt_text]
+# 每次抓取最多用 VLM 描述的图片数量；页面图片超过该值时优先描述最大的几张
+# （按 HEAD Content-Length 排序）。0 表示关闭 VLM 描述（保留 jina / 原始 alt）
+max_images = 3
+# 参与 VLM 描述的图片最短边下限（像素），用于跳过图标 / Logo
+min_dimension = 128
+# 生成图片描述使用的模型任务名（默认 Host 的 vlm 任务）
+model = "vlm"
+# 生成图片描述的提示词
+prompt = "请用中文详细描述这张图片的内容。请留意其主题、直观感受，输出为一段平文本，如果图中有文字，请把文字复述出来。如果一共超过了1024字，请进行概括总结。请注意不要分点，就输出一段最大1024字的文本"
+# 持久化描述缓存的条目上限（LRU，按图片内容哈希命中），0 表示不缓存
+cache_size = 1024

@@ -1,0 +1,1582 @@
+"""Fetch URL 插件。
+
+提供单一 ``fetch_url`` 工具：
+- 网页 / PDF：优先通过 jina.ai Reader 转 Markdown，失败时回退到本地抓取 + markdownify；
+- 图片：下载后按配置转码 / 压缩，通过 ``content_items`` 直接回传给麦麦观察；
+- 支持 start_char / end_char 分页窗口、超长内容 LLM 总结（注入人设）或截断；
+- 网页中的图片可由 VLM 生成描述并替换 alt 文本（优先级：VLM > jina 生成 alt > 原始 alt）。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import ipaddress
+import json
+import math
+import re
+from base64 import b64encode
+from collections import OrderedDict
+from hashlib import sha256
+from io import BytesIO
+from pathlib import Path
+from typing import Any
+from urllib.parse import urljoin, urlparse
+
+import httpx
+from bs4 import BeautifulSoup
+from markdownify import markdownify as html_to_markdown
+from PIL import Image
+
+from maibot_sdk import Field, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk.types import ToolParameterInfo, ToolParamType
+
+# --------------------------------------------------------------------------- #
+# 常量
+# --------------------------------------------------------------------------- #
+
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+JINA_READER_BASE = "https://r.jina.ai/"
+
+# 图片格式魔数嗅探（Content-Type 缺失或不可信时使用）
+_IMAGE_MAGIC_PREFIXES: tuple[tuple[bytes, str], ...] = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"BM", "image/bmp"),
+)
+_PDF_MAGIC = b"%PDF"
+
+# Markdown 图片语法：![alt](src "title")
+_MD_IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]\n]*)\]\(\s*(?P<src>[^)\s]+)(?P<title>\s+\"[^\"]*\")?\s*\)")
+
+# 自适应质量搜索 / 尺寸缩放的迭代上限
+_MAX_QUALITY_ITERATIONS = 6
+_MAX_DOWNSCALE_ITERATIONS = 8
+
+# HEAD 排序候选图片数量上限与并发数
+_ALT_TEXT_HEAD_CANDIDATE_LIMIT = 50
+_ALT_TEXT_HEAD_CONCURRENCY = 8
+
+# 送入 VLM 的图片最长边（内部约束，避免撑爆视觉模型负载）
+_VLM_INPUT_MAX_EDGE = 1024
+
+# LLM 总结时允许送入的最大字符数（防止 prompt 超过模型上下文）
+_MAX_SUMMARIZE_INPUT_CHARS = 60000
+
+# 描述缓存延迟写盘秒数
+_CACHE_FLUSH_DELAY_SECONDS = 5.0
+
+DEFAULT_ALT_TEXT_PROMPT = (
+    "请用中文详细描述这张图片的内容。请留意其主题、直观感受，输出为一段平文本，"
+    "如果图中有文字，请把文字复述出来。如果一共超过了1024字，请进行概括总结。"
+    "请注意不要分点，就输出一段最大1024字的文本"
+)
+
+DEFAULT_SUMMARIZE_PROMPT_TEMPLATE = """你是{nickname}。
+你的人格设定：{personality}
+你的表达风格：{reply_style}
+
+你刚刚通过 fetch_url 工具抓取了 {url} 的内容，但内容太长了：当前 {total} 字符，需要压缩到 {max_length} 字符以内。
+请将下面的内容总结成一份不超过 {max_length} 字符的摘要，尽量保留关键信息、数据、结论与重要链接。{focus_section}
+只输出摘要正文本身，不要输出任何解释、前言或额外说明。
+
+抓取到的内容：
+{content}"""
+
+
+class FetchUrlError(Exception):
+    """抓取流程中可直接展示给 LLM 的可读错误。"""
+
+
+# --------------------------------------------------------------------------- #
+# 通用工具函数
+# --------------------------------------------------------------------------- #
+
+
+def _render(template: str, **values: Any) -> str:
+    """使用 ``str.replace`` 渲染模板，避免正文中的花括号导致 format 异常。"""
+    rendered = template
+    for key, value in values.items():
+        rendered = rendered.replace("{" + key + "}", str(value))
+    return rendered
+
+
+def _format_exception(exc: BaseException) -> str:
+    """格式化异常为简短可读文本。"""
+    message = str(exc).strip()
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+
+
+def _normalize_image_format(fmt: str) -> str:
+    """规范化图片格式名（jpg -> jpeg，统一小写）。"""
+    normalized = str(fmt or "").strip().lower()
+    return "jpeg" if normalized == "jpg" else normalized
+
+
+def _sniff_image_mime(data: bytes) -> str:
+    """根据魔数嗅探图片 MIME；WEBP 需要额外判断 RIFF 容器。"""
+    for prefix, mime in _IMAGE_MAGIC_PREFIXES:
+        if data.startswith(prefix):
+            return mime
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return ""
+
+
+def _sanitize_alt_text(text: str) -> str:
+    """清洗 alt 文本，避免破坏 Markdown 图片语法。"""
+    sanitized = " ".join(str(text or "").split())
+    sanitized = sanitized.replace("[", "［").replace("]", "］").replace("(", "（").replace(")", "）")
+    return sanitized[:1024]
+
+
+def _is_private_address(address: str) -> bool:
+    """判断 IP 字符串是否属于内网 / 环回 / 链路本地 / 保留地址。"""
+    try:
+        ip_obj = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return bool(
+        ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_reserved
+        or ip_obj.is_multicast
+        or ip_obj.is_unspecified
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 图片处理（阻塞函数，统一通过 asyncio.to_thread 调用）
+# --------------------------------------------------------------------------- #
+
+
+def _flatten_for_jpeg(image: Image.Image) -> Image.Image:
+    """JPEG 不支持透明通道，将带 alpha 的图片平铺到白色背景。"""
+    if image.mode in {"RGBA", "LA", "PA"} or (image.mode == "P" and "transparency" in image.info):
+        rgba_image = image.convert("RGBA")
+        background = Image.new("RGB", rgba_image.size, (255, 255, 255))
+        background.paste(rgba_image, mask=rgba_image.split()[-1])
+        return background
+    return image.convert("RGB")
+
+
+def _coerce_rgb_like(image: Image.Image) -> Image.Image:
+    """将冷门色彩模式（CMYK / P / I;16 等）规范到 webp/png 可编码的模式。"""
+    if image.mode in {"RGB", "RGBA", "L", "LA"}:
+        return image
+    if image.mode == "P":
+        return image.convert("RGBA" if "transparency" in image.info else "RGB")
+    return image.convert("RGBA" if "A" in image.getbands() else "RGB")
+
+
+def _encode_image(
+    image: Image.Image,
+    fmt: str,
+    quality: int | None,
+    *,
+    keep_animation: bool = False,
+    animation_source: Image.Image | None = None,
+) -> bytes:
+    """将图片编码为目标格式字节。"""
+    buffer = BytesIO()
+    if fmt == "jpeg":
+        _flatten_for_jpeg(image).save(buffer, format="JPEG", quality=quality or 80, optimize=True)
+    elif fmt == "webp":
+        if keep_animation and animation_source is not None:
+            animation_source.save(buffer, format="WEBP", save_all=True, quality=quality or 80)
+        else:
+            _coerce_rgb_like(image).save(buffer, format="WEBP", quality=quality or 80, method=4)
+    elif fmt == "png":
+        _coerce_rgb_like(image).save(buffer, format="PNG", optimize=True)
+    elif fmt == "gif":
+        if keep_animation and animation_source is not None:
+            animation_source.save(buffer, format="GIF", save_all=True)
+        else:
+            image.convert("RGB").save(buffer, format="GIF")
+    else:
+        raise FetchUrlError(f"不支持的转换目标格式：{fmt}")
+    return buffer.getvalue()
+
+
+def _resize_keep_aspect(image: Image.Image, factor: float) -> Image.Image:
+    """按比例缩小图片，保持纵横比，最小边长 16 像素。"""
+    new_width = max(16, round(image.width * factor))
+    new_height = max(16, round(image.height * factor))
+    return _coerce_rgb_like(image).resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+
+def _adaptive_quality_search(
+    image: Image.Image,
+    fmt: str,
+    target_size: int,
+    quality_start: int,
+    quality_floor: int,
+    *,
+    keep_animation: bool = False,
+    animation_source: Image.Image | None = None,
+) -> tuple[bytes, int, bool]:
+    """自适应质量搜索：按 ``q × sqrt(target/actual)`` 启发式跳跃而非固定步进。
+
+    Returns:
+        (编码结果, 最终质量, 是否满足大小目标)
+    """
+    quality = max(quality_floor, min(100, quality_start))
+    encoded = b""
+    for _ in range(_MAX_QUALITY_ITERATIONS):
+        encoded = _encode_image(
+            image, fmt, quality, keep_animation=keep_animation, animation_source=animation_source
+        )
+        if len(encoded) <= target_size:
+            return encoded, quality, True
+        if quality <= quality_floor:
+            break
+        estimated = int(quality * math.sqrt(target_size / len(encoded)))
+        quality = max(quality_floor, min(quality - 5, estimated))
+    return encoded, quality, False
+
+
+def _normalize_image_blocking(
+    data: bytes,
+    *,
+    acceptable_formats: set[str],
+    convert_format: str,
+    max_image_size: int,
+    max_dimension: int,
+    quality_start: int,
+    quality_floor: int,
+) -> dict[str, Any]:
+    """校验并按需转码 / 压缩图片（阻塞实现）。
+
+    Returns:
+        dict: ``{"data", "format", "width", "height", "converted", "quality",
+        "downscaled", "animation_preserved", "original_format", "original_size"}``
+    """
+    with Image.open(BytesIO(data)) as probe:
+        probe.verify()
+
+    image = Image.open(BytesIO(data))
+    image.load()
+    src_format = _normalize_image_format(image.format or "")
+    animated = getattr(image, "n_frames", 1) > 1
+
+    if src_format in acceptable_formats and len(data) <= max_image_size:
+        return {
+            "data": data,
+            "format": src_format,
+            "width": image.width,
+            "height": image.height,
+            "converted": False,
+            "quality": None,
+            "downscaled": False,
+            "animation_preserved": animated,
+            "original_format": src_format,
+            "original_size": len(data),
+        }
+
+    target_fmt = convert_format
+    keep_animation = animated and target_fmt in {"webp", "gif"}
+    work = image
+    if animated:
+        image.seek(0)
+        work = image.copy()
+    downscaled = False
+
+    # 预缩放：超大图先压到 max_dimension，避免在高质量大图上浪费压缩计算
+    if max(work.size) > max_dimension:
+        work = _resize_keep_aspect(work, max_dimension / max(work.size))
+        keep_animation = False
+        downscaled = True
+
+    final_quality: int | None = None
+    if target_fmt in {"webp", "jpeg"}:
+        encoded, final_quality, fits = _adaptive_quality_search(
+            work,
+            target_fmt,
+            max_image_size,
+            quality_start,
+            quality_floor,
+            keep_animation=keep_animation,
+            animation_source=image if keep_animation else None,
+        )
+        if keep_animation and not fits:
+            # 动图在质量下限仍超标：放弃动画，仅保留首帧继续压缩
+            keep_animation = False
+            encoded, final_quality, fits = _adaptive_quality_search(
+                work, target_fmt, max_image_size, quality_start, quality_floor
+            )
+    else:
+        encoded = _encode_image(
+            work,
+            target_fmt,
+            None,
+            keep_animation=keep_animation,
+            animation_source=image if keep_animation else None,
+        )
+        fits = len(encoded) <= max_image_size
+
+    # 质量下限仍超标：按 sqrt(target/actual) 比例逐步缩小尺寸
+    for _ in range(_MAX_DOWNSCALE_ITERATIONS):
+        if fits:
+            break
+        factor = math.sqrt(max_image_size / len(encoded))
+        factor = max(0.3, min(0.95, factor))
+        if min(work.size) <= 16:
+            break
+        keep_animation = False
+        work = _resize_keep_aspect(work, factor)
+        downscaled = True
+        if target_fmt in {"webp", "jpeg"}:
+            encoded = _encode_image(work, target_fmt, quality_floor)
+            final_quality = quality_floor
+        else:
+            encoded = _encode_image(work, target_fmt, None)
+        fits = len(encoded) <= max_image_size
+
+    with Image.open(BytesIO(encoded)) as output_probe:
+        output_width, output_height = output_probe.size
+
+    return {
+        "data": encoded,
+        "format": target_fmt,
+        "width": output_width,
+        "height": output_height,
+        "converted": True,
+        "quality": final_quality,
+        "downscaled": downscaled,
+        "animation_preserved": keep_animation,
+        "original_format": src_format or "unknown",
+        "original_size": len(data),
+    }
+
+
+def _prepare_vlm_image_blocking(data: bytes, min_dimension: int) -> dict[str, Any] | None:
+    """为 VLM 输入准备图片：首帧、RGB、长边压到 1024、JPEG q80（阻塞实现）。
+
+    Returns:
+        dict | None: ``{"base64", "format", "width", "height"}``；
+        图片无效或尺寸小于 ``min_dimension``（疑似图标）时返回 ``None``。
+    """
+    try:
+        with Image.open(BytesIO(data)) as probe:
+            probe.verify()
+        image = Image.open(BytesIO(data))
+        image.load()
+    except Exception:
+        return None
+
+    width, height = image.size
+    if min(width, height) < min_dimension:
+        return None
+
+    if max(image.size) > _VLM_INPUT_MAX_EDGE:
+        image = _resize_keep_aspect(image, _VLM_INPUT_MAX_EDGE / max(image.size))
+    encoded = _encode_image(image, "jpeg", 80)
+    return {
+        "base64": b64encode(encoded).decode("ascii"),
+        "format": "jpeg",
+        "width": width,
+        "height": height,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 持久化 LRU 描述缓存
+# --------------------------------------------------------------------------- #
+
+
+class AltTextCache:
+    """以图片字节 sha256 为键的持久化 LRU 描述缓存。
+
+    内存中维护 LRU 顺序，落盘为插件 ``data/`` 目录下的 JSON 文件；
+    写入采用延迟合并（debounce）+ 卸载时强制刷盘。
+    """
+
+    def __init__(self, path: Path, max_entries: int) -> None:
+        self._path = path
+        self._max_entries = max(0, max_entries)
+        self._entries: OrderedDict[str, str] = OrderedDict()
+        self._flush_task: asyncio.Task[None] | None = None
+        self._dirty = False
+
+    def load(self) -> None:
+        """从磁盘加载缓存；文件缺失或损坏时静默从空开始。"""
+        if not self._path.exists():
+            return
+        try:
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+            entries = raw.get("entries") if isinstance(raw, dict) else None
+            if isinstance(entries, list):
+                for item in entries:
+                    if isinstance(item, list) and len(item) == 2:
+                        self._entries[str(item[0])] = str(item[1])
+        except Exception:
+            self._entries.clear()
+        self._trim()
+
+    def get(self, key: str) -> str | None:
+        """读取缓存并更新 LRU 顺序。"""
+        if key not in self._entries:
+            return None
+        self._entries.move_to_end(key)
+        return self._entries[key]
+
+    def put(self, key: str, value: str) -> None:
+        """写入缓存（自动淘汰最旧条目）并调度延迟刷盘。"""
+        if self._max_entries <= 0:
+            return
+        self._entries[key] = value
+        self._entries.move_to_end(key)
+        self._trim()
+        self._dirty = True
+        self._schedule_flush()
+
+    def set_max_entries(self, max_entries: int) -> None:
+        """热更新缓存容量。"""
+        self._max_entries = max(0, max_entries)
+        self._trim()
+
+    async def aclose(self) -> None:
+        """取消挂起的延迟刷盘并立即落盘。"""
+        if self._flush_task is not None:
+            self._flush_task.cancel()
+            self._flush_task = None
+        self._flush()
+
+    def _trim(self) -> None:
+        while len(self._entries) > self._max_entries:
+            self._entries.popitem(last=False)
+
+    def _schedule_flush(self) -> None:
+        if self._flush_task is not None and not self._flush_task.done():
+            return
+        try:
+            self._flush_task = asyncio.get_running_loop().create_task(self._delayed_flush())
+        except RuntimeError:
+            self._flush()
+
+    async def _delayed_flush(self) -> None:
+        await asyncio.sleep(_CACHE_FLUSH_DELAY_SECONDS)
+        self._flush()
+
+    def _flush(self) -> None:
+        if not self._dirty:
+            return
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps({"entries": list(self._entries.items())}, ensure_ascii=False)
+            tmp_path = self._path.with_suffix(".tmp")
+            tmp_path.write_text(payload, encoding="utf-8")
+            tmp_path.replace(self._path)
+            self._dirty = False
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# 配置模型
+# --------------------------------------------------------------------------- #
+
+
+class PluginSectionConfig(PluginConfigBase):
+    """插件基础配置。"""
+
+    __ui_label__ = "插件"
+    __ui_icon__ = "package"
+    __ui_order__ = 0
+
+    enabled: bool = Field(default=True, description="是否启用插件")
+    config_version: str = Field(default="1.1.0", description="配置版本")
+    always_visible_for_planner: bool = Field(
+        default=False,
+        description=(
+            "是否让 fetch_url 工具始终对 Planner 可见（等同 core_tool）。"
+            "开启后无需 tool_search 即可直接调用；修改后需重新加载插件才能生效。"
+        ),
+    )
+
+
+class FetchSectionConfig(PluginConfigBase):
+    """HTTP 抓取相关配置。"""
+
+    __ui_label__ = "抓取"
+    __ui_icon__ = "globe"
+    __ui_order__ = 1
+
+    timeout: float = Field(default=15.0, description="直接抓取 URL 的 HTTP 超时时间（秒）。")
+    proxy: str = Field(
+        default="",
+        description="抓取内容时使用的代理地址（例如 http://127.0.0.1:7890）；留空表示不使用代理。",
+    )
+    user_agent: str = Field(default=DEFAULT_USER_AGENT, description="抓取时使用的 User-Agent。")
+    max_download_size: int = Field(
+        default=16 * 1024 * 1024,
+        description="单次下载的最大字节数（默认 16 MB），超过即中止并报错。",
+    )
+    allow_private_networks: bool = Field(
+        default=False,
+        description="是否允许抓取内网 / 环回 / 保留地址。默认关闭（SSRF 防护），仅在确有需要时开启。",
+    )
+    cookies: str = Field(
+        default="",
+        description="对所有域名发送的全局 Cookie 字符串（例如 key1=value1; key2=value2）。请勿提交到版本库。",
+    )
+    domain_cookies: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "按域名配置的 Cookie，键为域名（匹配自身及子域名），值为 Cookie 字符串。"
+            "直接抓取时通过 Cookie 头发送，jina 抓取时通过 X-Set-Cookie 转发。请勿提交到版本库。"
+        ),
+    )
+
+
+class JinaSectionConfig(PluginConfigBase):
+    """jina.ai Reader 相关配置。"""
+
+    __ui_label__ = "Jina Reader"
+    __ui_icon__ = "book-open"
+    __ui_order__ = 2
+
+    enabled: bool = Field(
+        default=True,
+        description="是否优先使用 jina.ai Reader 抓取非图片内容（支持网页 / PDF，质量更好）。",
+    )
+    api_key: str = Field(
+        default="",
+        description="jina.ai API Key（可选）。不填也能用但有更严格的频率限制。请勿提交到版本库。",
+    )
+    timeout: float = Field(
+        default=30.0,
+        description="jina.ai 请求超时时间（秒）。超时视为提供方故障，自动回退到本地 markdownify 抓取。",
+    )
+    engine: str = Field(
+        default="browser",
+        description="jina.ai 渲染引擎（X-Engine 头），browser 渲染质量最好；留空表示由 jina 自动选择。",
+    )
+    with_generated_alt: bool = Field(
+        default=True,
+        description=(
+            "是否在配置了 jina API Key 时让 jina 为缺失 alt 的图片生成描述"
+            "（X-With-Generated-Alt 头）。未配置 API Key 时不会发送该头。"
+        ),
+    )
+
+
+class ImageSectionConfig(PluginConfigBase):
+    """图片转码 / 压缩相关配置。"""
+
+    __ui_label__ = "图片"
+    __ui_icon__ = "image"
+    __ui_order__ = 3
+
+    acceptable_formats: list[str] = Field(
+        default_factory=lambda: ["jpeg", "png", "gif", "webp"],
+        description="可直接回传的图片格式列表；不在列表内的格式会转换为 convert_format。",
+    )
+    convert_format: str = Field(
+        default="webp",
+        description="转换目标格式，可选 webp / jpeg / png / gif。",
+    )
+    max_image_size: int = Field(
+        default=2 * 1024 * 1024,
+        description="回传图片的最大字节数（默认 2 MB），超过会触发压缩。",
+    )
+    max_dimension: int = Field(
+        default=2048,
+        description="压缩时的最长边上限（像素）；超大图会先缩到该尺寸再做质量搜索。",
+    )
+    quality_start: int = Field(
+        default=80,
+        description="webp / jpeg 压缩的初始质量。",
+    )
+    quality_floor: int = Field(
+        default=10,
+        description="webp / jpeg 压缩的最低质量；到达下限仍超标时改为缩小图片尺寸。",
+    )
+
+
+class ContentSectionConfig(PluginConfigBase):
+    """文本内容长度相关配置。"""
+
+    __ui_label__ = "内容"
+    __ui_icon__ = "file-text"
+    __ui_order__ = 4
+
+    max_content_length: int = Field(
+        default=8000,
+        description="单次返回文本内容的最大字符数；超过时按 llm_summarize 设置进行总结或截断。",
+    )
+    llm_summarize: bool = Field(
+        default=True,
+        description="超长内容是否默认调用 LLM 总结；关闭后超长内容一律截断。",
+    )
+
+
+class LLMSectionConfig(PluginConfigBase):
+    """LLM 总结相关配置。"""
+
+    __ui_label__ = "LLM 总结"
+    __ui_icon__ = "sparkles"
+    __ui_order__ = 5
+
+    model: str = Field(
+        default="planner",
+        description="总结时使用的 LLM 模型任务名（planner / replyer 等 Host 任务名，不是原始模型 ID）。",
+    )
+    temperature: float = Field(default=0.3, description="总结时的采样温度。")
+    max_tokens: int = Field(
+        default=0,
+        description=(
+            "总结 LLM 调用的最大 token 数；0 表示自动按 max_content_length 的四倍计算。"
+            "若小于 max_content_length 会在日志中告警，输出可能被截断。"
+        ),
+    )
+    summarize_prompt_template: str = Field(
+        default=DEFAULT_SUMMARIZE_PROMPT_TEMPLATE,
+        description=(
+            "总结提示词模板。占位符：{nickname}、{personality}、{reply_style}、{url}、"
+            "{total}、{max_length}、{focus_section}、{content}。"
+        ),
+    )
+
+
+class AltTextSectionConfig(PluginConfigBase):
+    """VLM 图片描述（alt 文本替换）相关配置。"""
+
+    __ui_label__ = "图片描述"
+    __ui_icon__ = "eye"
+    __ui_order__ = 6
+
+    max_images: int = Field(
+        default=3,
+        description=(
+            "每次抓取最多用 VLM 描述的图片数量；页面图片超过该值时优先描述最大的几张"
+            "（按 HEAD Content-Length 排序）。0 表示关闭 VLM 描述（保留 jina / 原始 alt）。"
+        ),
+    )
+    min_dimension: int = Field(
+        default=128,
+        description="参与 VLM 描述的图片最短边下限（像素），用于跳过图标 / Logo。",
+    )
+    model: str = Field(
+        default="vlm",
+        description="生成图片描述使用的模型任务名（默认 Host 的 vlm 任务）。",
+    )
+    prompt: str = Field(
+        default=DEFAULT_ALT_TEXT_PROMPT,
+        description="生成图片描述的提示词。",
+    )
+    cache_size: int = Field(
+        default=1024,
+        description="持久化描述缓存的条目上限（LRU，按图片内容哈希命中），0 表示不缓存。",
+    )
+
+
+class FetchUrlConfig(PluginConfigBase):
+    """插件完整配置。"""
+
+    plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
+    fetch: FetchSectionConfig = Field(default_factory=FetchSectionConfig)
+    jina: JinaSectionConfig = Field(default_factory=JinaSectionConfig)
+    image: ImageSectionConfig = Field(default_factory=ImageSectionConfig)
+    content: ContentSectionConfig = Field(default_factory=ContentSectionConfig)
+    llm: LLMSectionConfig = Field(default_factory=LLMSectionConfig)
+    alt_text: AltTextSectionConfig = Field(default_factory=AltTextSectionConfig)
+
+
+# --------------------------------------------------------------------------- #
+# 插件主体
+# --------------------------------------------------------------------------- #
+
+
+class FetchUrlPlugin(MaiBotPlugin):
+    """fetch_url 插件主体。"""
+
+    config_model = FetchUrlConfig
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._plugin_dir = Path(__file__).resolve().parent
+        self._alt_cache: AltTextCache | None = None
+        # VLM 可用性：None=未知（尝试调用），True/False=已确认
+        self._vlm_available: bool | None = None
+        # 配置派生缓存，on_load / on_config_update 时刷新
+        self._timeout = 15.0
+        self._proxy = ""
+        self._user_agent = DEFAULT_USER_AGENT
+        self._max_download_size = 16 * 1024 * 1024
+        self._allow_private_networks = False
+        self._global_cookies = ""
+        self._domain_cookies: dict[str, str] = {}
+        self._jina_enabled = True
+        self._jina_api_key = ""
+        self._jina_timeout = 30.0
+        self._jina_engine = "browser"
+        self._jina_generated_alt = True
+        self._acceptable_formats: set[str] = {"jpeg", "png", "gif", "webp"}
+        self._convert_format = "webp"
+        self._max_image_size = 2 * 1024 * 1024
+        self._max_dimension = 2048
+        self._quality_start = 80
+        self._quality_floor = 10
+        self._max_content_length = 8000
+        self._llm_summarize = True
+        self._llm_model = "planner"
+        self._llm_temperature = 0.3
+        self._llm_max_tokens = 0
+        self._summarize_template = DEFAULT_SUMMARIZE_PROMPT_TEMPLATE
+        self._alt_max_images = 3
+        self._alt_min_dimension = 128
+        self._alt_model = "vlm"
+        self._alt_prompt = DEFAULT_ALT_TEXT_PROMPT
+        self._alt_cache_size = 1024
+        self._always_visible_for_planner = False
+        self._config_initialized = False
+
+    # ------------------------------------------------------------------ #
+    # 生命周期
+    # ------------------------------------------------------------------ #
+    async def on_load(self) -> None:
+        """插件加载：刷新配置并初始化描述缓存。"""
+        self._refresh_config()
+        cache_path = self._plugin_dir / "data" / "alt_text_cache.json"
+        self._alt_cache = AltTextCache(cache_path, self._alt_cache_size)
+        self._alt_cache.load()
+        self.ctx.logger.info(
+            "fetch_url 插件已加载：jina=%s, 总结=%s, VLM描述上限=%d 张, 描述缓存=%d 条, Planner常显=%s",
+            "开" if self._jina_enabled else "关",
+            "开" if self._llm_summarize else "关",
+            self._alt_max_images,
+            self._alt_cache_size,
+            "开" if self._always_visible_for_planner else "关",
+        )
+
+    async def on_unload(self) -> None:
+        """插件卸载：刷盘描述缓存。"""
+        if self._alt_cache is not None:
+            await self._alt_cache.aclose()
+            self._alt_cache = None
+        self.ctx.logger.info("fetch_url 插件已卸载")
+
+    async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
+        """配置热更新：刷新派生缓存。"""
+        del config_data
+        if scope == "self":
+            self._refresh_config()
+            self._vlm_available = None
+            if self._alt_cache is not None:
+                self._alt_cache.set_max_entries(self._alt_cache_size)
+            self.ctx.logger.info("fetch_url 插件配置已更新: version=%s", version)
+
+    def get_components(self) -> list[dict[str, Any]]:
+        """收集组件声明，并按配置决定 fetch_url 是否对 Planner 常显。
+
+        Runner 在 ``on_load`` 之前调用本方法，因此直接读取 ``self.config``，
+        不依赖 ``_refresh_config`` 已执行的派生缓存。
+        """
+        components = super().get_components()
+        try:
+            always_visible = bool(self.config.plugin.always_visible_for_planner)
+        except RuntimeError:
+            always_visible = self._always_visible_for_planner
+        if not always_visible:
+            return components
+        for component in components:
+            if component.get("name") != "fetch_url":
+                continue
+            metadata = component.get("metadata")
+            if isinstance(metadata, dict):
+                metadata["core_tool"] = True
+                metadata["visibility"] = "visible"
+        return components
+
+    def _refresh_config(self) -> None:
+        """从强类型配置刷新派生缓存。"""
+        plugin = self.config.plugin
+        next_always_visible = bool(plugin.always_visible_for_planner)
+        if self._config_initialized and next_always_visible != self._always_visible_for_planner:
+            self.ctx.logger.warning(
+                "always_visible_for_planner 已变更，请禁用后重新启用插件以使 Planner 工具可见性生效"
+            )
+        self._always_visible_for_planner = next_always_visible
+        self._config_initialized = True
+
+        fetch = self.config.fetch
+        self._timeout = max(1.0, float(fetch.timeout))
+        self._proxy = (fetch.proxy or "").strip()
+        self._user_agent = (fetch.user_agent or DEFAULT_USER_AGENT).strip() or DEFAULT_USER_AGENT
+        self._max_download_size = max(1024, int(fetch.max_download_size))
+        self._allow_private_networks = bool(fetch.allow_private_networks)
+        self._global_cookies = (fetch.cookies or "").strip()
+        self._domain_cookies = {
+            str(domain).strip().lstrip(".").lower(): str(cookie).strip()
+            for domain, cookie in (fetch.domain_cookies or {}).items()
+            if str(domain).strip() and str(cookie).strip()
+        }
+
+        jina = self.config.jina
+        self._jina_enabled = bool(jina.enabled)
+        self._jina_api_key = (jina.api_key or "").strip()
+        self._jina_timeout = max(1.0, float(jina.timeout))
+        self._jina_engine = (jina.engine or "").strip()
+        self._jina_generated_alt = bool(jina.with_generated_alt)
+
+        image = self.config.image
+        formats = {_normalize_image_format(fmt) for fmt in (image.acceptable_formats or [])}
+        self._acceptable_formats = {fmt for fmt in formats if fmt} or {"jpeg", "png", "gif", "webp"}
+        convert_format = _normalize_image_format(image.convert_format)
+        self._convert_format = convert_format if convert_format in {"webp", "jpeg", "png", "gif"} else "webp"
+        self._max_image_size = max(8 * 1024, int(image.max_image_size))
+        self._max_dimension = max(64, int(image.max_dimension))
+        self._quality_start = min(100, max(1, int(image.quality_start)))
+        self._quality_floor = min(self._quality_start, max(1, int(image.quality_floor)))
+
+        content = self.config.content
+        self._max_content_length = max(256, int(content.max_content_length))
+        self._llm_summarize = bool(content.llm_summarize)
+
+        llm = self.config.llm
+        self._llm_model = (llm.model or "planner").strip() or "planner"
+        self._llm_temperature = float(llm.temperature)
+        self._llm_max_tokens = max(0, int(llm.max_tokens))
+        self._summarize_template = llm.summarize_prompt_template or DEFAULT_SUMMARIZE_PROMPT_TEMPLATE
+
+        alt_text = self.config.alt_text
+        self._alt_max_images = max(0, int(alt_text.max_images))
+        self._alt_min_dimension = max(1, int(alt_text.min_dimension))
+        self._alt_model = (alt_text.model or "vlm").strip() or "vlm"
+        self._alt_prompt = alt_text.prompt or DEFAULT_ALT_TEXT_PROMPT
+        self._alt_cache_size = max(0, int(alt_text.cache_size))
+
+        self._warn_if_summarize_max_tokens_too_low(self._resolve_summarize_max_tokens())
+
+    def _resolve_summarize_max_tokens(self) -> int:
+        """解析总结调用的 max_tokens；``llm.max_tokens=0`` 时按 ``max_content_length × 4`` 自动计算。"""
+        if self._llm_max_tokens > 0:
+            return self._llm_max_tokens
+        return self._max_content_length * 4
+
+    def _warn_if_summarize_max_tokens_too_low(self, max_tokens: int) -> None:
+        """当 max_tokens 不足以容纳目标摘要长度时记录告警。"""
+        if max_tokens < self._max_content_length:
+            self.ctx.logger.warning(
+                "总结 max_tokens(%d) 小于 max_content_length(%d)，摘要输出可能因 token 上限被截断",
+                max_tokens,
+                self._max_content_length,
+            )
+
+    # ------------------------------------------------------------------ #
+    # HTTP 基础设施
+    # ------------------------------------------------------------------ #
+    def _build_client(self, timeout: float | None = None) -> httpx.AsyncClient:
+        """构建带 SSRF 防护钩子的 HTTP 客户端。"""
+        effective_timeout = timeout if timeout is not None else self._timeout
+        return httpx.AsyncClient(
+            headers={
+                "User-Agent": self._user_agent,
+                "Accept": "text/html,application/xhtml+xml,application/json,image/*,*/*",
+            },
+            timeout=httpx.Timeout(effective_timeout, connect=min(effective_timeout, 10.0)),
+            follow_redirects=True,
+            proxy=self._proxy or None,
+            event_hooks={"request": [self._ssrf_request_hook]},
+        )
+
+    async def _ssrf_request_hook(self, request: httpx.Request) -> None:
+        """请求钩子：每一跳（含重定向目标）都执行内网地址检查。"""
+        await self._assert_host_allowed(str(request.url.host or ""))
+
+    async def _assert_host_allowed(self, host: str) -> None:
+        """校验目标主机不属于内网 / 保留地址（除非配置放行）。"""
+        if self._allow_private_networks:
+            return
+        if not host:
+            raise FetchUrlError("无法解析目标主机名")
+        stripped_host = host.strip("[]")
+        try:
+            ipaddress.ip_address(stripped_host)
+            addresses = [stripped_host]
+        except ValueError:
+            try:
+                infos = await asyncio.get_running_loop().getaddrinfo(stripped_host, None)
+            except OSError as exc:
+                raise FetchUrlError(f"域名解析失败：{stripped_host}（{_format_exception(exc)}）") from exc
+            addresses = [str(info[4][0]) for info in infos]
+        for address in addresses:
+            if _is_private_address(address):
+                raise FetchUrlError(
+                    f"目标地址 {stripped_host} 解析到内网/保留地址，已被安全策略拦截"
+                    "（可在配置 fetch.allow_private_networks 中放行）"
+                )
+
+    def _cookie_header_for(self, url: str) -> str:
+        """根据全局与按域名 Cookie 配置，拼出适用于该 URL 的 Cookie 字符串。"""
+        host = (urlparse(url).hostname or "").lower()
+        parts: list[str] = []
+        if self._global_cookies:
+            parts.append(self._global_cookies)
+        for domain, cookie in self._domain_cookies.items():
+            if host == domain or host.endswith("." + domain):
+                parts.append(cookie)
+        return "; ".join(part.strip().strip(";") for part in parts if part.strip())
+
+    # ------------------------------------------------------------------ #
+    # 抓取与内容类型探测
+    # ------------------------------------------------------------------ #
+    async def _probe_url(self, client: httpx.AsyncClient, url: str) -> dict[str, Any]:
+        """流式 GET 目标 URL 并按响应头 + 魔数判定内容类型。
+
+        Returns:
+            dict: ``kind`` 为 ``image`` 时带完整 ``data``；
+            ``text``（jina 关闭时）带完整 ``data`` 与 ``encoding``；
+            ``defer``（jina 开启的非图片内容）不带数据，由调用方走 jina。
+        """
+        headers: dict[str, str] = {}
+        cookie_header = self._cookie_header_for(url)
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+
+        async with client.stream("GET", url, headers=headers) as response:
+            response.raise_for_status()
+            final_url = str(response.url)
+            content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+
+            iterator = response.aiter_bytes()
+            first_chunk = b""
+            async for chunk in iterator:
+                first_chunk = chunk
+                break
+
+            sniffed_mime = _sniff_image_mime(first_chunk)
+            is_image = content_type.startswith("image/") or (
+                bool(sniffed_mime) and (not content_type or content_type == "application/octet-stream")
+            )
+            is_pdf = content_type == "application/pdf" or first_chunk.startswith(_PDF_MAGIC)
+
+            if is_image:
+                buffer = bytearray(first_chunk)
+                async for chunk in iterator:
+                    buffer.extend(chunk)
+                    if len(buffer) > self._max_download_size:
+                        raise FetchUrlError(
+                            f"图片超过下载大小上限（{self._max_download_size} 字节），已中止下载"
+                        )
+                return {
+                    "kind": "image",
+                    "data": bytes(buffer),
+                    "content_type": content_type or sniffed_mime,
+                    "final_url": final_url,
+                }
+
+            if is_pdf:
+                return {"kind": "pdf", "content_type": content_type, "final_url": final_url}
+
+            if self._jina_enabled:
+                return {"kind": "defer", "content_type": content_type, "final_url": final_url}
+
+            buffer = bytearray(first_chunk)
+            async for chunk in iterator:
+                buffer.extend(chunk)
+                if len(buffer) > self._max_download_size:
+                    raise FetchUrlError(
+                        f"页面超过下载大小上限（{self._max_download_size} 字节），已中止下载"
+                    )
+            return {
+                "kind": "text",
+                "data": bytes(buffer),
+                "content_type": content_type,
+                "final_url": final_url,
+                "encoding": response.charset_encoding or "utf-8",
+            }
+
+    async def _fetch_via_jina(self, url: str) -> str:
+        """通过 jina.ai Reader 抓取并返回 Markdown 文本。"""
+        headers: dict[str, str] = {
+            "Accept": "text/plain",
+            "X-Return-Format": "markdown",
+        }
+        if self._jina_api_key:
+            headers["Authorization"] = f"Bearer {self._jina_api_key}"
+        if self._jina_engine:
+            headers["X-Engine"] = self._jina_engine
+        if self._jina_generated_alt and self._jina_api_key:
+            headers["X-With-Generated-Alt"] = "true"
+        cookie_header = self._cookie_header_for(url)
+        if cookie_header:
+            headers["X-Set-Cookie"] = cookie_header
+
+        async with self._build_client(timeout=self._jina_timeout) as client:
+            response = await client.get(f"{JINA_READER_BASE}{url}", headers=headers)
+            response.raise_for_status()
+            if len(response.content) > self._max_download_size:
+                raise FetchUrlError("jina 返回内容超过下载大小上限")
+            return response.text
+
+    async def _fetch_direct_markdown(self, client: httpx.AsyncClient, url: str) -> tuple[str, str]:
+        """直接抓取页面并用 markdownify 转为 Markdown。
+
+        Returns:
+            tuple: ``(markdown, final_url)``。
+        """
+        probe = await self._probe_url_force_text(client, url)
+        content_type: str = probe["content_type"]
+        final_url: str = probe["final_url"]
+        text = probe["data"].decode(probe["encoding"], errors="replace")
+
+        if "html" in content_type or content_type in {"", "application/octet-stream"}:
+            markdown = await asyncio.to_thread(self._html_to_markdown_blocking, text, final_url)
+            return markdown, final_url
+        if content_type.startswith("text/") or content_type in {"application/json", "application/xml"}:
+            return text, final_url
+        raise FetchUrlError(f"不支持直接解析的内容类型：{content_type or '未知'}（可尝试启用 jina）")
+
+    async def _probe_url_force_text(self, client: httpx.AsyncClient, url: str) -> dict[str, Any]:
+        """强制按文本下载完整正文（jina 回退路径使用）。"""
+        headers: dict[str, str] = {}
+        cookie_header = self._cookie_header_for(url)
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+
+        async with client.stream("GET", url, headers=headers) as response:
+            response.raise_for_status()
+            content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+            buffer = bytearray()
+            async for chunk in response.aiter_bytes():
+                buffer.extend(chunk)
+                if len(buffer) > self._max_download_size:
+                    raise FetchUrlError(
+                        f"页面超过下载大小上限（{self._max_download_size} 字节），已中止下载"
+                    )
+            return {
+                "data": bytes(buffer),
+                "content_type": content_type,
+                "final_url": str(response.url),
+                "encoding": response.charset_encoding or "utf-8",
+            }
+
+    @staticmethod
+    def _html_to_markdown_blocking(html: str, base_url: str) -> str:
+        """剔除噪声标签、补全相对链接后将 HTML 转为 Markdown（阻塞实现）。"""
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style", "noscript", "template"]):
+            tag.decompose()
+        for anchor in soup.find_all("a", href=True):
+            anchor["href"] = urljoin(base_url, anchor["href"])
+        for img in soup.find_all("img"):
+            src = img.get("src")
+            if src:
+                img["src"] = urljoin(base_url, src)
+        return html_to_markdown(str(soup), heading_style="ATX").strip()
+
+    async def _download_image_bytes(self, client: httpx.AsyncClient, url: str) -> bytes | None:
+        """下载单张图片字节（带大小上限），失败返回 None。"""
+        headers: dict[str, str] = {}
+        cookie_header = self._cookie_header_for(url)
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+        try:
+            async with client.stream("GET", url, headers=headers) as response:
+                response.raise_for_status()
+                buffer = bytearray()
+                async for chunk in response.aiter_bytes():
+                    buffer.extend(chunk)
+                    if len(buffer) > self._max_download_size:
+                        return None
+                return bytes(buffer)
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------ #
+    # VLM 图片描述（alt 文本替换）
+    # ------------------------------------------------------------------ #
+    async def _check_vlm_available(self) -> bool:
+        """检查 VLM 模型任务是否可用（结果按会话缓存）。"""
+        if self._vlm_available is not None:
+            return self._vlm_available
+        try:
+            models = await self.ctx.llm.get_available_models()
+        except Exception:
+            models = []
+        if models:
+            self._vlm_available = self._alt_model in models
+        else:
+            # 查询失败时不下结论，先尝试调用
+            self._vlm_available = True
+        return self._vlm_available
+
+    async def _describe_image_with_vlm(self, image_payload: dict[str, Any]) -> str:
+        """调用 VLM 为单张图片生成描述；失败返回空字符串。"""
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": self._alt_prompt},
+                    {
+                        "type": "image",
+                        "image_format": image_payload["format"],
+                        "image_base64": image_payload["base64"],
+                    },
+                ],
+            }
+        ]
+        try:
+            result = await self.ctx.llm.generate(prompt=messages, model=self._alt_model)
+        except Exception as exc:
+            self.ctx.logger.warning("VLM 图片描述调用异常：%s", _format_exception(exc))
+            return ""
+        if not result.get("success"):
+            self.ctx.logger.warning("VLM 图片描述失败：%s", result.get("error") or "未知错误")
+            return ""
+        return (result.get("response") or "").strip()
+
+    async def _rank_image_candidates(self, client: httpx.AsyncClient, srcs: list[str]) -> list[str]:
+        """通过并发 HEAD 请求按 Content-Length 从大到小排序候选图片。"""
+        candidates = srcs[:_ALT_TEXT_HEAD_CANDIDATE_LIMIT]
+        semaphore = asyncio.Semaphore(_ALT_TEXT_HEAD_CONCURRENCY)
+
+        async def head_size(src: str) -> tuple[str, int | None]:
+            async with semaphore:
+                try:
+                    response = await client.head(src)
+                    length = response.headers.get("content-length")
+                    return src, int(length) if length and length.isdigit() else None
+                except Exception:
+                    return src, None
+
+        results = await asyncio.gather(*(head_size(src) for src in candidates))
+        ranked = sorted(results, key=lambda item: (item[1] is None, -(item[1] or 0)))
+        return [src for src, _ in ranked]
+
+    async def _apply_vlm_alt_text(self, markdown: str, base_url: str) -> tuple[str, int]:
+        """对窗口内 Markdown 图片应用 VLM 描述替换。
+
+        优先级：VLM 描述 > jina 生成 alt > 原始 alt。仅对按大小排名前
+        ``max_images`` 且最短边不小于 ``min_dimension`` 的图片调用 VLM。
+
+        Returns:
+            tuple: ``(替换后的 Markdown, 成功描述的图片数)``。
+        """
+        if self._alt_max_images <= 0 or self._alt_cache is None:
+            return markdown, 0
+
+        matches = list(_MD_IMAGE_RE.finditer(markdown))
+        if not matches:
+            return markdown, 0
+        if not await self._check_vlm_available():
+            return markdown, 0
+
+        seen: set[str] = set()
+        ordered_srcs: list[str] = []
+        for match in matches:
+            src = urljoin(base_url, match.group("src"))
+            if src.startswith(("http://", "https://")) and src not in seen:
+                seen.add(src)
+                ordered_srcs.append(src)
+        if not ordered_srcs:
+            return markdown, 0
+
+        descriptions: dict[str, str] = {}
+        async with self._build_client() as client:
+            ranked_srcs = await self._rank_image_candidates(client, ordered_srcs)
+            for src in ranked_srcs:
+                if len(descriptions) >= self._alt_max_images:
+                    break
+                data = await self._download_image_bytes(client, src)
+                if data is None:
+                    continue
+                cache_key = sha256(data).hexdigest()
+                cached = self._alt_cache.get(cache_key)
+                if cached:
+                    descriptions[src] = cached
+                    continue
+                payload = await asyncio.to_thread(
+                    _prepare_vlm_image_blocking, data, self._alt_min_dimension
+                )
+                if payload is None:
+                    continue
+                description = await self._describe_image_with_vlm(payload)
+                if not description:
+                    # 单次调用失败大概率是模型故障，本次抓取不再继续尝试
+                    break
+                self._alt_cache.put(cache_key, description)
+                descriptions[src] = description
+
+        if not descriptions:
+            return markdown, 0
+
+        def replace(match: re.Match[str]) -> str:
+            src = urljoin(base_url, match.group("src"))
+            description = descriptions.get(src)
+            if not description:
+                return match.group(0)
+            title = match.group("title") or ""
+            return f"![{_sanitize_alt_text(description)}]({match.group('src')}{title})"
+
+        return _MD_IMAGE_RE.sub(replace, markdown), len(descriptions)
+
+    # ------------------------------------------------------------------ #
+    # LLM 总结
+    # ------------------------------------------------------------------ #
+    async def _summarize(self, text: str, url: str, focus: str) -> str:
+        """调用 LLM 将超长内容总结到 max_content_length 以内；失败返回空字符串。"""
+        nickname = await self.ctx.config.get("bot.nickname", "麦麦") or "麦麦"
+        personality = await self.ctx.config.get("personality.personality", "") or ""
+        reply_style = await self.ctx.config.get("personality.reply_style", "") or ""
+
+        input_text = text
+        if len(input_text) > _MAX_SUMMARIZE_INPUT_CHARS:
+            input_text = input_text[:_MAX_SUMMARIZE_INPUT_CHARS]
+        focus_section = f"\n本次总结请特别关注：{focus}" if focus.strip() else ""
+        prompt = _render(
+            self._summarize_template,
+            nickname=nickname,
+            personality=personality,
+            reply_style=reply_style,
+            url=url,
+            total=len(text),
+            max_length=self._max_content_length,
+            focus_section=focus_section,
+            content=input_text,
+        )
+        max_tokens = self._resolve_summarize_max_tokens()
+        try:
+            result = await self.ctx.llm.generate(
+                prompt=prompt,
+                model=self._llm_model,
+                temperature=self._llm_temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception as exc:
+            self.ctx.logger.warning("LLM 总结调用异常：%s", _format_exception(exc))
+            return ""
+        if not result.get("success"):
+            self.ctx.logger.warning("LLM 总结失败：%s", result.get("error") or "未知错误")
+            return ""
+        return (result.get("response") or "").strip()
+
+    # ------------------------------------------------------------------ #
+    # fetch_url 工具
+    # ------------------------------------------------------------------ #
+    @Tool(
+        "fetch_url",
+        brief_description="抓取任意 URL：网页/PDF 转为 Markdown 文本返回，图片直接以图像形式返回，支持分页读取与超长内容自动总结。",
+        detailed_description=(
+            "抓取一个 URL 并返回其内容。会自动根据响应类型分流：图片直接以图像形式回传供你观察；"
+            "网页 / PDF 等转为 Markdown 文本。\n"
+            "参数说明：\n"
+            "- url：string，必填。要抓取的完整 URL（http/https）。\n"
+            "- start_char：integer，可选，默认 0。返回文本窗口的起始字符位置。\n"
+            "- end_char：integer，可选，默认 -1（文档末尾）。返回文本窗口的结束字符位置。\n"
+            "- on_exceed：string，可选，summarize 或 truncate，默认 summarize。窗口内容超过长度上限时，"
+            "summarize 表示调用 LLM 总结，truncate 表示直接截断返回原文。\n"
+            "- summary_focus：string，可选。总结时需要特别关注的方面。\n"
+            "结果中会标注文档总长与本次返回的窗口范围；当内容被总结或截断时，"
+            "可通过 start_char / end_char 指定不超过长度上限的窗口来分段获取未删改的原文。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="url",
+                param_type=ToolParamType.STRING,
+                description="要抓取的完整 URL（http/https）",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="start_char",
+                param_type=ToolParamType.INTEGER,
+                description="返回文本窗口的起始字符位置，默认 0",
+                required=False,
+                default=0,
+            ),
+            ToolParameterInfo(
+                name="end_char",
+                param_type=ToolParamType.INTEGER,
+                description="返回文本窗口的结束字符位置，默认 -1 表示文档末尾",
+                required=False,
+                default=-1,
+            ),
+            ToolParameterInfo(
+                name="on_exceed",
+                param_type=ToolParamType.STRING,
+                description="窗口内容超过长度上限时的处理方式：summarize=LLM 总结（默认），truncate=截断返回原文",
+                required=False,
+                enum_values=["summarize", "truncate"],
+                default="summarize",
+            ),
+            ToolParameterInfo(
+                name="summary_focus",
+                param_type=ToolParamType.STRING,
+                description="总结时需要特别关注的方面（可选）",
+                required=False,
+                default="",
+            ),
+        ],
+    )
+    async def fetch_url(
+        self,
+        url: str = "",
+        start_char: int = 0,
+        end_char: int = -1,
+        on_exceed: str = "summarize",
+        summary_focus: str = "",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del kwargs
+        try:
+            return await self._fetch_url_impl(
+                url=str(url or "").strip(),
+                start_char=_safe_int(start_char, 0),
+                end_char=_safe_int(end_char, -1),
+                on_exceed=str(on_exceed or "summarize").strip().lower(),
+                summary_focus=str(summary_focus or ""),
+            )
+        except FetchUrlError as exc:
+            return {"success": False, "content": f"抓取失败：{exc}"}
+        except httpx.HTTPStatusError as exc:
+            return {
+                "success": False,
+                "content": f"抓取失败：目标服务器返回 HTTP {exc.response.status_code}（{url}）",
+            }
+        except httpx.TimeoutException:
+            return {"success": False, "content": f"抓取失败：请求超时（{url}）"}
+        except Exception as exc:
+            self.ctx.logger.error("fetch_url 执行异常：url=%s, error=%s", url, _format_exception(exc))
+            return {"success": False, "content": f"抓取失败：{_format_exception(exc)}"}
+
+    async def _fetch_url_impl(
+        self,
+        *,
+        url: str,
+        start_char: int,
+        end_char: int,
+        on_exceed: str,
+        summary_focus: str,
+    ) -> dict[str, Any]:
+        """fetch_url 的主流程。"""
+        if not url:
+            raise FetchUrlError("缺少必要参数 url")
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            raise FetchUrlError("仅支持 http/https 协议的 URL")
+        if not parsed.hostname:
+            raise FetchUrlError("URL 缺少有效的主机名")
+        await self._assert_host_allowed(parsed.hostname)
+
+        async with self._build_client() as client:
+            probe = await self._probe_url(client, url)
+
+            if probe["kind"] == "image":
+                return await self._build_image_result(url, probe)
+
+            markdown, provider, final_url = await self._fetch_text_content(client, url, probe)
+
+        return await self._build_text_result(
+            markdown=markdown,
+            provider=provider,
+            url=url,
+            final_url=final_url,
+            start_char=start_char,
+            end_char=end_char,
+            on_exceed=on_exceed,
+            summary_focus=summary_focus,
+        )
+
+    async def _fetch_text_content(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        probe: dict[str, Any],
+    ) -> tuple[str, str, str]:
+        """获取非图片内容的 Markdown 文本。
+
+        Returns:
+            tuple: ``(markdown, provider, final_url)``。
+        """
+        is_pdf = probe["kind"] == "pdf"
+
+        if self._jina_enabled:
+            try:
+                markdown = await self._fetch_via_jina(url)
+                if markdown.strip():
+                    return markdown.strip(), "jina", probe["final_url"]
+                raise FetchUrlError("jina 返回了空内容")
+            except FetchUrlError as exc:
+                self.ctx.logger.warning("jina 抓取失败，回退本地抓取：url=%s, error=%s", url, exc)
+            except Exception as exc:
+                self.ctx.logger.warning(
+                    "jina 抓取失败，回退本地抓取：url=%s, error=%s", url, _format_exception(exc)
+                )
+
+        if is_pdf:
+            raise FetchUrlError(
+                "该 URL 是 PDF 文件，本地解析器不支持 PDF；请启用 jina（或检查 jina 可用性）后重试"
+            )
+
+        if probe["kind"] == "text":
+            text = probe["data"].decode(probe["encoding"], errors="replace")
+            content_type = probe["content_type"]
+            if "html" in content_type or content_type in {"", "application/octet-stream"}:
+                markdown = await asyncio.to_thread(
+                    self._html_to_markdown_blocking, text, probe["final_url"]
+                )
+            else:
+                markdown = text
+            return markdown, "markdownify", probe["final_url"]
+
+        markdown, final_url = await self._fetch_direct_markdown(client, url)
+        return markdown, "markdownify", final_url
+
+    async def _build_image_result(self, url: str, probe: dict[str, Any]) -> dict[str, Any]:
+        """图片路径：转码 / 压缩后通过 content_items 回传。"""
+        try:
+            info = await asyncio.to_thread(
+                _normalize_image_blocking,
+                probe["data"],
+                acceptable_formats=self._acceptable_formats,
+                convert_format=self._convert_format,
+                max_image_size=self._max_image_size,
+                max_dimension=self._max_dimension,
+                quality_start=self._quality_start,
+                quality_floor=self._quality_floor,
+            )
+        except FetchUrlError:
+            raise
+        except Exception as exc:
+            raise FetchUrlError(f"图片解析失败，可能不是有效的图片文件（{_format_exception(exc)}）") from exc
+
+        digest = sha256(info["data"]).hexdigest()[:8]
+        notes: list[str] = []
+        if info["converted"]:
+            notes.append(f"已从 {info['original_format']} 转换为 {info['format']}")
+            if info["quality"] is not None:
+                notes.append(f"压缩质量 {info['quality']}")
+        if info["downscaled"]:
+            notes.append("已缩小尺寸")
+        note_text = f"（{'，'.join(notes)}）" if notes else ""
+
+        content = (
+            f"已获取图片：{probe['final_url']}\n"
+            f"格式 {info['format']}，尺寸 {info['width']}x{info['height']}，"
+            f"大小 {len(info['data'])} 字节{note_text}。图片内容见对应的媒体消息。"
+        )
+        return {
+            "success": True,
+            "content": content,
+            "final_url": probe["final_url"],
+            "content_items": [
+                {
+                    "content_type": "image",
+                    "data": b64encode(info["data"]).decode("ascii"),
+                    "mime_type": f"image/{info['format']}",
+                    "name": f"fetch_{digest}.{info['format']}",
+                    "description": f"通过 fetch_url 抓取的图片：{url}",
+                    "metadata": {
+                        "source_url": url,
+                        "final_url": probe["final_url"],
+                        "original_format": info["original_format"],
+                        "original_size": info["original_size"],
+                        "output_size": len(info["data"]),
+                        "width": info["width"],
+                        "height": info["height"],
+                        "converted": info["converted"],
+                        "animation_preserved": info["animation_preserved"],
+                    },
+                }
+            ],
+        }
+
+    async def _build_text_result(
+        self,
+        *,
+        markdown: str,
+        provider: str,
+        url: str,
+        final_url: str,
+        start_char: int,
+        end_char: int,
+        on_exceed: str,
+        summary_focus: str,
+    ) -> dict[str, Any]:
+        """文本路径：窗口切片 + VLM alt 替换 + 超长总结 / 截断。"""
+        total_chars = len(markdown)
+        start = max(0, min(start_char, total_chars))
+        end = total_chars if end_char < 0 else max(start, min(end_char, total_chars))
+        window = markdown[start:end]
+
+        if not window:
+            return {
+                "success": True,
+                "content": (
+                    f"【fetch_url】来源：{final_url}（{provider}）\n"
+                    f"文档总长 {total_chars} 字符，但请求的窗口 [{start}, {end}) 为空。"
+                    f"请调整 start_char / end_char 后重试。"
+                ),
+                "total_chars": total_chars,
+                "returned_range": [start, end],
+                "processed": "empty",
+                "provider": provider,
+                "final_url": final_url,
+            }
+
+        window, described_count = await self._apply_vlm_alt_text(window, final_url)
+
+        processed = "full"
+        body = window
+        notice_lines = [
+            f"【fetch_url】来源：{final_url}（{provider}）",
+            f"文档总长 {total_chars} 字符；本次窗口 [{start}, {end})。",
+        ]
+        if described_count:
+            notice_lines.append(f"已用视觉模型为 {described_count} 张图片生成描述并替换 alt 文本。")
+
+        if len(window) > self._max_content_length:
+            use_summarize = self._llm_summarize and on_exceed != "truncate"
+            summary = ""
+            if use_summarize:
+                summary = await self._summarize(window, final_url, summary_focus)
+            if summary:
+                processed = "summarized"
+                body = summary
+                notice_lines.append(
+                    f"窗口内容超过上限 {self._max_content_length} 字符，以下为 LLM 总结的摘要；"
+                    f"如需未删改原文，请用 start_char / end_char 指定不超过 "
+                    f"{self._max_content_length} 字符的窗口分段获取。"
+                )
+            else:
+                processed = "truncated"
+                truncate_end = start + self._max_content_length
+                body = window[: self._max_content_length]
+                end = min(end, truncate_end)
+                reason = "" if use_summarize is False else "（LLM 总结失败，已回退为截断）"
+                notice_lines.append(
+                    f"窗口内容超过上限 {self._max_content_length} 字符，已截断至 [{start}, {end})"
+                    f"{reason}；可用 start_char={end} 继续获取后续内容。"
+                )
+                notice_lines[1] = f"文档总长 {total_chars} 字符；本次窗口 [{start}, {end})。"
+
+        content = "\n".join(notice_lines) + "\n\n" + body
+        return {
+            "success": True,
+            "content": content,
+            "total_chars": total_chars,
+            "returned_range": [start, end],
+            "processed": processed,
+            "provider": provider,
+            "final_url": final_url,
+        }
+
+
+def _safe_int(value: Any, default: int) -> int:
+    """宽容地将 LLM 传入的参数转换为整数。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def create_plugin() -> FetchUrlPlugin:
+    """创建插件实例。"""
+    return FetchUrlPlugin()

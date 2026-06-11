@@ -1,0 +1,11 @@
+# 插件本地数据（图片描述缓存等）
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# 本地配置（可能含 Cookie / API Key）
+config.local.toml
