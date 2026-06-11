@@ -607,7 +607,7 @@ class ContentSectionConfig(PluginConfigBase):
     __ui_order__ = 4
 
     max_content_length: int = Field(
-        default=8000,
+        default=8192,
         description="单次返回文本内容的最大字符数；超过时按 llm_summarize 设置进行总结或截断。",
     )
     llm_summarize: bool = Field(
@@ -723,7 +723,7 @@ class FetchUrlPlugin(MaiBotPlugin):
         self._max_dimension = 2048
         self._quality_start = 80
         self._quality_floor = 10
-        self._max_content_length = 8000
+        self._max_content_length = 8192
         self._llm_summarize = True
         self._llm_model = "planner"
         self._llm_temperature = 0.3

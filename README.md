@@ -32,7 +32,7 @@
 
 ### 超长内容窗口与总结
 
-- 文档超过 `max_content_length`（默认 8000 字符）时：
+- 文档超过 `max_content_length`（默认 8192 字符）时：
   - `llm_summarize = true`（默认）→ 调用 LLM 总结，提示词注入麦麦的昵称 / 人格 / 表达风格
   - 关闭总结或工具调用时指定 `on_exceed=truncate` → 截断返回原文
 - 麦麦可通过 `start_char` / `end_char` 指定窗口分段读取未删改原文；自定义窗口若仍超限，则只总结该窗口
@@ -76,7 +76,7 @@
 | `image.acceptable_formats`               | jpeg/png/gif/webp | 可直接回传的图片格式                     |
 | `image.convert_format`                   | webp              | 转换目标格式                         |
 | `image.max_image_size`                   | 2 MB              | 回传图片大小上限                       |
-| `content.max_content_length`             | 8000              | 单次返回文本上限（字符）                   |
+| `content.max_content_length`             | 8192              | 单次返回文本上限（字符）                   |
 | `content.llm_summarize`                  | true              | 超长内容是否 LLM 总结                  |
 | `llm.model`                              | planner           | 总结用的模型**任务名**（非原始模型 ID）        |
 | `alt_text.max_images`                    | 3                 | 每次抓取最多 VLM 描述的图片数（0 关闭）        |

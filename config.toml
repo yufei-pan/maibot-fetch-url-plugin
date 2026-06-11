@@ -55,7 +55,7 @@ quality_floor = 10
 
 [content]
 # 单次返回文本内容的最大字符数；超过时按 llm_summarize 设置进行总结或截断
-max_content_length = 8000
+max_content_length = 8192
 # 超长内容是否默认调用 LLM 总结；关闭后超长内容一律截断
 llm_summarize = true
 
