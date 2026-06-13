@@ -1,7 +1,7 @@
 [plugin]
 # 是否启用插件
 enabled = true
-# 配置版本（低于插件模型默认值时，Runner 会触发迁移并写回；见 config_migrations.py）
+# 配置版本（低于插件模型默认值时，Runner 会触发迁移并写回）
 config_version = "1.5.0"
 # 是否让 fetch_url 始终对 Planner 可见（无需 tool_search 发现）。修改后需重新加载插件才能生效
 always_visible_for_planner = false

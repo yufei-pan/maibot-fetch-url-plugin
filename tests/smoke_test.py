@@ -19,7 +19,6 @@ sys.path.insert(0, str(PLUGIN_DIR))
 from PIL import Image  # noqa: E402
 
 import plugin as fetch_plugin  # noqa: E402
-from config_migrations import CURRENT_CONFIG_VERSION, normalize_fetch_url_config  # noqa: E402
 
 _INBOUND = dict(
     acceptable_formats={"jpeg", "png", "gif", "webp"},
@@ -110,9 +109,9 @@ def test_config_migration_from_1_2_0() -> None:
             "max_animation_frames": 512,
         },
     }
-    merged, changed, notes = normalize_fetch_url_config(legacy, default_config)
+    merged, changed, notes = fetch_plugin._normalize_fetch_url_config(legacy, default_config)
     assert changed
-    assert merged["plugin"]["config_version"] == CURRENT_CONFIG_VERSION
+    assert merged["plugin"]["config_version"] == fetch_plugin.CURRENT_CONFIG_VERSION
     assert merged["fetch"]["max_download_size"] == 64 * 1024 * 1024
     assert merged["image"]["max_image_size"] == 16 * 1024 * 1024
     assert merged["image"]["max_dimension"] == 4096
@@ -124,7 +123,7 @@ def test_config_migration_from_1_2_0() -> None:
         **legacy,
         "image": {**legacy["image"], "max_image_size": 5 * 1024 * 1024},
     }
-    merged_custom, _, _ = normalize_fetch_url_config(legacy_custom, default_config)
+    merged_custom, _, _ = fetch_plugin._normalize_fetch_url_config(legacy_custom, default_config)
     assert merged_custom["image"]["max_image_size"] == 5 * 1024 * 1024
     print("ok: customized max_image_size preserved during migration")
 
@@ -146,7 +145,7 @@ def test_config_migration_alt_text_image_renames() -> None:
             },
         },
     }
-    merged, changed, notes = normalize_fetch_url_config(legacy, default_config)
+    merged, changed, notes = fetch_plugin._normalize_fetch_url_config(legacy, default_config)
     assert changed
     alt_image = merged["alt_text"]["image"]
     assert alt_image["target_image_size"] == 1024 * 1024
@@ -178,7 +177,7 @@ def test_plugin_importable() -> None:
     assert instance is not None
     default_config = type(instance).build_default_config()
     assert default_config["plugin"]["enabled"] is True
-    assert default_config["plugin"]["config_version"] == CURRENT_CONFIG_VERSION
+    assert default_config["plugin"]["config_version"] == fetch_plugin.CURRENT_CONFIG_VERSION
     assert default_config["image"]["convert_format"] == "webp"
     assert default_config["alt_text"]["cache_size"] == 1024
     assert default_config["alt_text"]["image"]["convert_format"] == "webp"
