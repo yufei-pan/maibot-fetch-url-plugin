@@ -25,7 +25,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup
 from markdownify import markdownify as html_to_markdown
-from PIL import Image
+from PIL import Image, ImageOps, ImageSequence
 
 from maibot_sdk import Field, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
@@ -53,9 +53,21 @@ _PDF_MAGIC = b"%PDF"
 # Markdown 图片语法：![alt](src "title")
 _MD_IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]\n]*)\]\(\s*(?P<src>[^)\s]+)(?P<title>\s+\"[^\"]*\")?\s*\)")
 
-# 自适应质量搜索 / 尺寸缩放的迭代上限
-_MAX_QUALITY_ITERATIONS = 6
-_MAX_DOWNSCALE_ITERATIONS = 8
+# 质量估算用的试编码像素数上限（编码耗时大致与像素数成正比，
+# 试编码成本仅为全尺寸压缩的几个百分点）
+_PROBE_MAX_PIXELS = 65536
+
+# 单次估算模式的目标比例：估算目标 = max_image_size × 该比例，预留些许上下浮动空间
+_SINGLE_PASS_TARGET_RATIO = 0.9
+
+# 动图帧缺省时长（毫秒），与 Pillow 对 GIF 的常见缺省值一致
+_DEFAULT_FRAME_DURATION_MS = 100
+
+# 能承载动画的输出格式：webp→动态 WebP，png→APNG，gif→动态 GIF；jpeg 不支持
+_ANIMATED_CAPABLE_FORMATS = {"webp", "png", "gif"}
+
+# 动图处理策略：keep_animated=保留动画按输出格式编码；skip=动图原样放行；first_frame=只保留首帧
+_VALID_ANIMATED_POLICIES = ("keep_animated", "skip", "first_frame")
 
 # HEAD 排序候选图片数量上限与并发数
 _ALT_TEXT_HEAD_CANDIDATE_LIMIT = 50
@@ -174,32 +186,88 @@ def _coerce_rgb_like(image: Image.Image) -> Image.Image:
     return image.convert("RGBA" if "A" in image.getbands() else "RGB")
 
 
-def _encode_image(
-    image: Image.Image,
-    fmt: str,
-    quality: int | None,
-    *,
-    keep_animation: bool = False,
-    animation_source: Image.Image | None = None,
-) -> bytes:
-    """将图片编码为目标格式字节。"""
+def _prepare_static_frame(image: Image.Image, fmt: str) -> Image.Image:
+    """把静态图（或动图首帧）整理为适合目标格式编码的模式。
+
+    - 先应用 EXIF 方向（转码后 EXIF 会丢失，必须先转正）；
+    - jpeg 不支持透明，把 alpha 拍平到白色背景；
+    - webp / png / gif 走 :func:`_coerce_rgb_like`，保留可保留的透明通道。
+    """
+    normalized = ImageOps.exif_transpose(image)
+    if fmt == "jpeg":
+        return _flatten_for_jpeg(normalized)
+    return _coerce_rgb_like(normalized)
+
+
+def _quality_adjustable(fmt: str) -> bool:
+    """输出是否能通过降质量缩小体积：png / gif 不行，只能缩像素尺寸。"""
+    return fmt in {"webp", "jpeg"}
+
+
+def _encode_image(image: Image.Image, fmt: str, quality: int | None) -> bytes:
+    """将单帧静态图编码为目标格式字节（png / gif 忽略 quality）。"""
     buffer = BytesIO()
     if fmt == "jpeg":
         _flatten_for_jpeg(image).save(buffer, format="JPEG", quality=quality or 80, optimize=True)
     elif fmt == "webp":
-        if keep_animation and animation_source is not None:
-            animation_source.save(buffer, format="WEBP", save_all=True, quality=quality or 80)
-        else:
-            _coerce_rgb_like(image).save(buffer, format="WEBP", quality=quality or 80, method=4)
+        _coerce_rgb_like(image).save(buffer, format="WEBP", quality=quality or 80, method=4)
     elif fmt == "png":
         _coerce_rgb_like(image).save(buffer, format="PNG", optimize=True)
     elif fmt == "gif":
-        if keep_animation and animation_source is not None:
-            animation_source.save(buffer, format="GIF", save_all=True)
-        else:
-            image.convert("RGB").save(buffer, format="GIF")
+        image.convert("RGB").save(buffer, format="GIF")
     else:
         raise FetchUrlError(f"不支持的转换目标格式：{fmt}")
+    return buffer.getvalue()
+
+
+def _encode_animated(image: Image.Image, fmt: str, quality: int) -> bytes:
+    """把多帧图片整体转为动画，保留每帧时长与循环次数。
+
+    webp 输出为动态 WebP，png 输出为 APNG，gif 输出为动态 GIF；均保留逐帧时长与 loop。
+    一次性整图编码（不做多轮质量搜索），符合单次压缩的资源约束。
+    """
+    frames: list[Image.Image] = []
+    durations: list[int] = []
+    for frame in ImageSequence.Iterator(image):
+        frames.append(frame.convert("RGBA"))
+        durations.append(int(frame.info.get("duration", _DEFAULT_FRAME_DURATION_MS)) or _DEFAULT_FRAME_DURATION_MS)
+
+    buffer = BytesIO()
+    loop = int(image.info.get("loop", 0))
+    if fmt == "webp":
+        frames[0].save(
+            buffer,
+            format="WEBP",
+            save_all=True,
+            append_images=frames[1:],
+            duration=durations,
+            loop=loop,
+            quality=quality,
+            method=4,
+        )
+    elif fmt == "png":
+        # APNG：PNG 无损，固定最高压缩率
+        frames[0].save(
+            buffer,
+            format="PNG",
+            save_all=True,
+            append_images=frames[1:],
+            duration=durations,
+            loop=loop,
+            optimize=True,
+            compress_level=9,
+        )
+    else:
+        # 动态 GIF：Pillow 会把 RGBA 帧量化到调色板
+        frames[0].save(
+            buffer,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=durations,
+            loop=loop,
+            disposal=2,
+        )
     return buffer.getvalue()
 
 
@@ -210,34 +278,85 @@ def _resize_keep_aspect(image: Image.Image, factor: float) -> Image.Image:
     return _coerce_rgb_like(image).resize((new_width, new_height), Image.Resampling.LANCZOS)
 
 
-def _adaptive_quality_search(
+def _estimate_quality_and_scale(
     image: Image.Image,
     fmt: str,
     target_size: int,
     quality_start: int,
     quality_floor: int,
-    *,
-    keep_animation: bool = False,
-    animation_source: Image.Image | None = None,
-) -> tuple[bytes, int, bool]:
-    """自适应质量搜索：按 ``q × sqrt(target/actual)`` 启发式跳跃而非固定步进。
+) -> tuple[int, float]:
+    """单次估算满足目标体积所需的质量，必要时附加一个等比缩放比例。
+
+    做法：把图片等比缩到不超过 ``_PROBE_MAX_PIXELS`` 像素做一次试编码，按像素数
+    外推全尺寸体积，再用 ``q × sqrt(目标/实际)`` 启发式反解质量。质量下限仍不够时，
+    按“体积近似随质量平方变化”的同一模型补一个缩放比例，保证仍然只做单次全尺寸编码。
+
+    png / gif 没有质量可调，超出目标时直接按“体积随像素数线性变化”反解缩放比例。
 
     Returns:
-        (编码结果, 最终质量, 是否满足大小目标)
+        (估算质量, 缩放比例)；比例为 1.0 表示无需缩放。
     """
-    quality = max(quality_floor, min(100, quality_start))
-    encoded = b""
-    for _ in range(_MAX_QUALITY_ITERATIONS):
-        encoded = _encode_image(
-            image, fmt, quality, keep_animation=keep_animation, animation_source=animation_source
-        )
-        if len(encoded) <= target_size:
-            return encoded, quality, True
-        if quality <= quality_floor:
-            break
-        estimated = int(quality * math.sqrt(target_size / len(encoded)))
-        quality = max(quality_floor, min(quality - 5, estimated))
-    return encoded, quality, False
+    pixels = image.width * image.height
+    probe = image
+    if pixels > _PROBE_MAX_PIXELS:
+        probe = _resize_keep_aspect(image, math.sqrt(_PROBE_MAX_PIXELS / pixels))
+    probe_encoded = _encode_image(probe, fmt, quality_start)
+    estimated_full = len(probe_encoded) * pixels / (probe.width * probe.height)
+
+    if estimated_full <= target_size:
+        return quality_start, 1.0
+
+    if not _quality_adjustable(fmt):
+        # png / gif：只能缩小像素尺寸
+        scale = math.sqrt(target_size / estimated_full)
+        return quality_start, max(0.1, min(1.0, scale))
+
+    estimated_quality = int(quality_start * math.sqrt(target_size / estimated_full))
+    if estimated_quality >= quality_floor:
+        return estimated_quality, 1.0
+
+    # 质量压到下限仍不够：按 q² 体积模型估算下限时的体积，反解需要的缩放比例
+    estimated_at_floor = estimated_full * (quality_floor / quality_start) ** 2
+    scale = math.sqrt(target_size / estimated_at_floor)
+    return quality_floor, max(0.1, min(1.0, scale))
+
+
+def _encode_static_pipeline(
+    image: Image.Image,
+    fmt: str,
+    orig_size: int,
+    max_image_size: int,
+    max_dimension: int,
+    quality_start: int,
+    quality_floor: int,
+) -> tuple[bytes, int | None, bool]:
+    """静态图单次编码管线：模式整理 → 超大图预缩放 → 质量估算后单次编码。
+
+    全程最多一次小图试编码 + 一次全尺寸编码，不做多轮“质量搜索 / 缩放”循环。
+
+    Returns:
+        ``(编码结果, 最终质量或 None, 是否缩小过尺寸)``。
+    """
+    prepared = _prepare_static_frame(image, fmt)
+    downscaled = False
+    # 预缩放：超大图先压到 max_dimension，避免在高质量大图上浪费压缩计算
+    if max_dimension > 0 and max(prepared.size) > max_dimension:
+        prepared = _resize_keep_aspect(prepared, max_dimension / max(prepared.size))
+        downscaled = True
+
+    adjustable = _quality_adjustable(fmt)
+    # 原图未超过阈值时单次最高质量转码即可
+    if orig_size <= max_image_size:
+        quality = quality_start if adjustable else None
+        return _encode_image(prepared, fmt, quality), quality, downscaled
+
+    # 估算质量（png / gif 则估算缩放比例）后全尺寸单次编码，允许结果在目标附近上下浮动
+    target_size = int(max_image_size * _SINGLE_PASS_TARGET_RATIO)
+    quality, scale = _estimate_quality_and_scale(prepared, fmt, target_size, quality_start, quality_floor)
+    if scale < 1.0:
+        prepared = _resize_keep_aspect(prepared, scale)
+        downscaled = True
+    return _encode_image(prepared, fmt, quality if adjustable else None), (quality if adjustable else None), downscaled
 
 
 def _normalize_image_blocking(
@@ -249,8 +368,13 @@ def _normalize_image_blocking(
     max_dimension: int,
     quality_start: int,
     quality_floor: int,
+    animated_policy: str = "keep_animated",
+    max_animation_frames: int = 512,
 ) -> dict[str, Any]:
-    """校验并按需转码 / 压缩图片（阻塞实现）。
+    """校验并按需转码 / 压缩图片（阻塞实现，单次压缩策略）。
+
+    静态图走 :func:`_encode_static_pipeline` 单次估算编码；动图按 ``animated_policy``
+    决定保留动画（webp→动态 WebP / png→APNG / gif→动态 GIF）、原样放行或只取首帧。
 
     Returns:
         dict: ``{"data", "format", "width", "height", "converted", "quality",
@@ -262,8 +386,9 @@ def _normalize_image_blocking(
     image = Image.open(BytesIO(data))
     image.load()
     src_format = _normalize_image_format(image.format or "")
-    animated = getattr(image, "n_frames", 1) > 1
+    is_animated = bool(getattr(image, "is_animated", False)) and getattr(image, "n_frames", 1) > 1
 
+    # 源格式已可直接回传且大小达标 → 原样放行
     if src_format in acceptable_formats and len(data) <= max_image_size:
         return {
             "data": data,
@@ -273,69 +398,61 @@ def _normalize_image_blocking(
             "converted": False,
             "quality": None,
             "downscaled": False,
-            "animation_preserved": animated,
+            "animation_preserved": is_animated,
             "original_format": src_format,
             "original_size": len(data),
         }
 
     target_fmt = convert_format
-    keep_animation = animated and target_fmt in {"webp", "gif"}
-    work = image
-    if animated:
-        image.seek(0)
-        work = image.copy()
-    downscaled = False
 
-    # 预缩放：超大图先压到 max_dimension，避免在高质量大图上浪费压缩计算
-    if max(work.size) > max_dimension:
-        work = _resize_keep_aspect(work, max_dimension / max(work.size))
-        keep_animation = False
-        downscaled = True
+    # 动图按策略处理；skip 直接原样放行，不做任何重编码
+    if is_animated and animated_policy == "skip":
+        return {
+            "data": data,
+            "format": src_format,
+            "width": image.width,
+            "height": image.height,
+            "converted": False,
+            "quality": None,
+            "downscaled": False,
+            "animation_preserved": True,
+            "original_format": src_format,
+            "original_size": len(data),
+        }
 
-    final_quality: int | None = None
-    if target_fmt in {"webp", "jpeg"}:
-        encoded, final_quality, fits = _adaptive_quality_search(
-            work,
-            target_fmt,
-            max_image_size,
-            quality_start,
-            quality_floor,
-            keep_animation=keep_animation,
-            animation_source=image if keep_animation else None,
-        )
-        if keep_animation and not fits:
-            # 动图在质量下限仍超标：放弃动画，仅保留首帧继续压缩
+    # 是否保留动画：策略允许 + 目标格式能承载 + 帧数未超上限
+    keep_animation = is_animated and animated_policy == "keep_animated" and target_fmt in _ANIMATED_CAPABLE_FORMATS
+    if keep_animation and max_animation_frames > 0:
+        frame_count = getattr(image, "n_frames", 1)
+        if frame_count > max_animation_frames:
             keep_animation = False
-            encoded, final_quality, fits = _adaptive_quality_search(
-                work, target_fmt, max_image_size, quality_start, quality_floor
-            )
-    else:
-        encoded = _encode_image(
-            work,
-            target_fmt,
-            None,
-            keep_animation=keep_animation,
-            animation_source=image if keep_animation else None,
-        )
-        fits = len(encoded) <= max_image_size
 
-    # 质量下限仍超标：按 sqrt(target/actual) 比例逐步缩小尺寸
-    for _ in range(_MAX_DOWNSCALE_ITERATIONS):
-        if fits:
-            break
-        factor = math.sqrt(max_image_size / len(encoded))
-        factor = max(0.3, min(0.95, factor))
-        if min(work.size) <= 16:
-            break
-        keep_animation = False
-        work = _resize_keep_aspect(work, factor)
-        downscaled = True
-        if target_fmt in {"webp", "jpeg"}:
-            encoded = _encode_image(work, target_fmt, quality_floor)
-            final_quality = quality_floor
-        else:
-            encoded = _encode_image(work, target_fmt, None)
-        fits = len(encoded) <= max_image_size
+    if keep_animation:
+        encoded = _encode_animated(image, target_fmt, quality_start)
+        # 单次动图编码后仍超标 → 优雅退化为首帧静态图继续压缩
+        if len(encoded) <= max_image_size:
+            with Image.open(BytesIO(encoded)) as output_probe:
+                output_width, output_height = output_probe.size
+            return {
+                "data": encoded,
+                "format": target_fmt,
+                "width": output_width,
+                "height": output_height,
+                "converted": True,
+                "quality": quality_start if _quality_adjustable(target_fmt) else None,
+                "downscaled": False,
+                "animation_preserved": True,
+                "original_format": src_format or "unknown",
+                "original_size": len(data),
+            }
+
+    # 静态路径：非动图 / first_frame 策略 / 动图保留失败时的首帧回退
+    if is_animated:
+        image.seek(0)
+
+    encoded, final_quality, downscaled = _encode_static_pipeline(
+        image, target_fmt, len(data), max_image_size, max_dimension, quality_start, quality_floor
+    )
 
     with Image.open(BytesIO(encoded)) as output_probe:
         output_width, output_height = output_probe.size
@@ -348,7 +465,7 @@ def _normalize_image_blocking(
         "converted": True,
         "quality": final_quality,
         "downscaled": downscaled,
-        "animation_preserved": keep_animation,
+        "animation_preserved": False,
         "original_format": src_format or "unknown",
         "original_size": len(data),
     }
@@ -490,7 +607,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.1.0", description="配置版本")
+    config_version: str = Field(default="1.2.0", description="配置版本")
     always_visible_for_planner: bool = Field(
         default=False,
         description=(
@@ -596,6 +713,18 @@ class ImageSectionConfig(PluginConfigBase):
     quality_floor: int = Field(
         default=10,
         description="webp / jpeg 压缩的最低质量；到达下限仍超标时改为缩小图片尺寸。",
+    )
+    animated_policy: str = Field(
+        default="keep_animated",
+        description=(
+            "动图（GIF 等多帧图片）处理策略：keep_animated=保留动画并按目标格式编码"
+            "（webp→动态 WebP，png→APNG，gif→动态 GIF）；skip=动图原样放行不压缩；"
+            "first_frame=只保留首帧转静态图。目标格式为 jpeg（无法承载动画）时自动退化为首帧。"
+        ),
+    )
+    max_animation_frames: int = Field(
+        default=512,
+        description="保留动画时的帧数上限，超过则退化为首帧静态图（防止超长 GIF 编码耗时过久）；0 表示不限制。",
     )
 
 
@@ -723,6 +852,8 @@ class FetchUrlPlugin(MaiBotPlugin):
         self._max_dimension = 2048
         self._quality_start = 80
         self._quality_floor = 10
+        self._animated_policy = "keep_animated"
+        self._max_animation_frames = 512
         self._max_content_length = 8192
         self._llm_summarize = True
         self._llm_model = "planner"
@@ -834,6 +965,12 @@ class FetchUrlPlugin(MaiBotPlugin):
         self._max_dimension = max(64, int(image.max_dimension))
         self._quality_start = min(100, max(1, int(image.quality_start)))
         self._quality_floor = min(self._quality_start, max(1, int(image.quality_floor)))
+        animated_policy = (image.animated_policy or "keep_animated").strip().lower()
+        if animated_policy not in _VALID_ANIMATED_POLICIES:
+            self.ctx.logger.warning("无效的动图策略 %r，回退为 keep_animated", animated_policy)
+            animated_policy = "keep_animated"
+        self._animated_policy = animated_policy
+        self._max_animation_frames = max(0, int(image.max_animation_frames))
 
         content = self.config.content
         self._max_content_length = max(256, int(content.max_content_length))
@@ -1441,6 +1578,8 @@ class FetchUrlPlugin(MaiBotPlugin):
                 max_dimension=self._max_dimension,
                 quality_start=self._quality_start,
                 quality_floor=self._quality_floor,
+                animated_policy=self._animated_policy,
+                max_animation_frames=self._max_animation_frames,
             )
         except FetchUrlError:
             raise

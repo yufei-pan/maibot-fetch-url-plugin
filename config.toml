@@ -2,7 +2,7 @@
 # 是否启用插件
 enabled = true
 # 配置版本
-config_version = "1.1.0"
+config_version = "1.2.0"
 # 是否让 fetch_url 始终对 Planner 可见（无需 tool_search 发现）。修改后需重新加载插件才能生效
 always_visible_for_planner = false
 
@@ -46,12 +46,20 @@ acceptable_formats = ["jpeg", "png", "gif", "webp"]
 convert_format = "webp"
 # 回传图片的最大字节数（默认 2 MB），超过会触发压缩
 max_image_size = 2097152
-# 压缩时的最长边上限（像素）；超大图会先缩到该尺寸再做质量搜索
+# 压缩时的最长边上限（像素）；超大图会先缩到该尺寸再做单次估算编码
 max_dimension = 2048
-# webp / jpeg 压缩的初始质量
+# webp / jpeg 压缩的初始（最高）质量；超过大小目标时实际质量会由单次估算从这里往下调
 quality_start = 80
 # webp / jpeg 压缩的最低质量；到达下限仍超标时改为缩小图片尺寸
 quality_floor = 10
+# 动图（GIF 等多帧图片）处理策略：
+#   keep_animated=保留动画并按目标格式编码（webp→动态 WebP，png→APNG，gif→动态 GIF）
+#   skip=动图原样放行不压缩
+#   first_frame=只保留首帧转静态图
+# 目标格式为 jpeg（无法承载动画）时自动退化为首帧
+animated_policy = "keep_animated"
+# 保留动画时的帧数上限，超过则退化为首帧静态图；0 表示不限制
+max_animation_frames = 512
 
 [content]
 # 单次返回文本内容的最大字符数；超过时按 llm_summarize 设置进行总结或截断

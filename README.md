@@ -24,11 +24,15 @@
 ### 图片转码与压缩
 
 - 格式不在 `acceptable_formats`（默认 jpeg/png/gif/webp）内 → 转为 `convert_format`（默认 webp）
-- 大小超过 `max_image_size`（默认 2 MB）→ 压缩：
+- 大小超过 `max_image_size`（默认 2 MB）→ **单次压缩**（资源友好，不做多轮重压缩）：
   1. 超大图先缩到 `max_dimension`（默认 2048 px）
-  2. 从质量 80 开始自适应搜索（按 `q × sqrt(目标/实际)` 跳跃，下限 10）
-  3. 质量下限仍超标时按比例逐步缩小尺寸
-- 动图转 webp 时尽量保留动画；需要缩放时取首帧
+  2. 用小图试编码快速估算达到大小目标所需的质量（按 `q × sqrt(目标/实际)`，从 `quality_start`/默认 80 往下，下限 `quality_floor`/默认 10）
+  3. 质量压到下限仍不够时，在同一次估算里补一个缩放比例，随后**全尺寸只编码一次**
+  - 结果允许在目标附近上下浮动；png / gif 无质量可调，超标时直接按估算比例缩小尺寸
+- 动图（GIF 等多帧图片）由 `animated_policy`（默认 `keep_animated`）控制，保留逐帧时长与循环次数：
+  - `keep_animated` → 按目标格式编码（webp→动态 WebP，png→APNG，gif→动态 GIF）；目标为 jpeg、帧数超 `max_animation_frames`（默认 512）或编码后仍超标时，优雅退化为首帧静态图
+  - `skip` → 动图原样放行不压缩
+  - `first_frame` → 只保留首帧转静态图
 
 ### 超长内容窗口与总结
 
@@ -75,7 +79,9 @@
 | `jina.engine`                            | browser           | jina 渲染引擎（质量最好）                |
 | `image.acceptable_formats`               | jpeg/png/gif/webp | 可直接回传的图片格式                     |
 | `image.convert_format`                   | webp              | 转换目标格式                         |
-| `image.max_image_size`                   | 2 MB              | 回传图片大小上限                       |
+| `image.max_image_size`                   | 2 MB              | 回传图片大小上限（超过触发单次压缩）             |
+| `image.animated_policy`                  | keep_animated     | 动图策略：keep_animated/skip/first_frame |
+| `image.max_animation_frames`             | 512               | 保留动画的帧数上限（超过退化为首帧，0 不限）        |
 | `content.max_content_length`             | 8192              | 单次返回文本上限（字符）                   |
 | `content.llm_summarize`                  | true              | 超长内容是否 LLM 总结                  |
 | `llm.model`                              | planner           | 总结用的模型**任务名**（非原始模型 ID）        |

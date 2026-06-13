@@ -38,6 +38,45 @@ def _make_image_bytes(fmt: str, size: tuple[int, int], noisy: bool = False) -> b
     return buffer.getvalue()
 
 
+def _make_detailed_image_bytes(fmt: str, size: tuple[int, int]) -> bytes:
+    """生成可中等压缩的细节图：低分辨率噪声放大成平滑色块。
+
+    这类内容遵循 JPEG“体积近似随质量平方变化”的模型，单次质量估算在其上表现具有代表性
+    （纯随机噪声是任何单次估算器的病态输入，不适合用来校验单次压缩的目标贴合度）。
+    """
+    import random
+
+    random.seed(11)
+    low_width = max(1, size[0] // 16)
+    low_height = max(1, size[1] // 16)
+    low = Image.new("RGB", (low_width, low_height))
+    low.putdata(
+        [
+            (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+            for _ in range(low_width * low_height)
+        ]
+    )
+    image = low.resize(size, Image.Resampling.BILINEAR)
+    buffer = BytesIO()
+    image.save(buffer, format=fmt.upper())
+    return buffer.getvalue()
+
+
+def _make_animated_gif_bytes(size: tuple[int, int], frames: int = 4) -> bytes:
+    """生成多帧动画 GIF 字节（逐帧改变颜色）。"""
+    images = [Image.new("RGB", size, ((index * 60) % 256, 30, 200)) for index in range(frames)]
+    buffer = BytesIO()
+    images[0].save(
+        buffer,
+        format="GIF",
+        save_all=True,
+        append_images=images[1:],
+        duration=120,
+        loop=0,
+    )
+    return buffer.getvalue()
+
+
 def test_get_components_planner_visibility() -> None:
     instance = fetch_plugin.create_plugin()
     components_off = instance.get_components()
@@ -104,23 +143,111 @@ def test_image_format_conversion() -> None:
     print("ok: unacceptable format converted to webp")
 
 
-def test_image_compression_with_downscale() -> None:
-    # 大尺寸噪声图 + 很小的目标，必须触发质量搜索与尺寸缩放
-    data = _make_image_bytes("png", (1600, 1200), noisy=True)
-    target = 24 * 1024
-    result = fetch_plugin._normalize_image_blocking(
-        data,
+def test_image_compression_single_pass() -> None:
+    # 单次估算编码会预缩放到 max_dimension 并按估算质量一次成型。单次压缩不保证严格贴合目标
+    # （结果允许在目标附近上下浮动），但估算应对目标有单调响应：目标越紧 → 质量越低、体积越小。
+    data = _make_detailed_image_bytes("png", (1600, 1200))
+    common = dict(
         acceptable_formats={"jpeg", "png", "gif", "webp"},
         convert_format="jpeg",
-        max_image_size=target,
         max_dimension=1024,
         quality_start=80,
         quality_floor=10,
     )
+    loose = fetch_plugin._normalize_image_blocking(data, max_image_size=200 * 1024, **common)
+    tight = fetch_plugin._normalize_image_blocking(data, max_image_size=12 * 1024, **common)
+
+    # 行为：均触发转码并预缩放到 max_dimension，且远小于原始 PNG 体积
+    assert loose["converted"] is True and tight["converted"] is True
+    assert loose["downscaled"] is True and tight["downscaled"] is True
+    assert len(tight["data"]) < len(data)
+    # 单次估算对目标有单调响应：更紧的目标产出更低的质量与更小的体积
+    assert tight["quality"] is not None and tight["quality"] < 80
+    assert len(tight["data"]) < len(loose["data"])
+    print(
+        f"ok: single-pass responds to target — loose={len(loose['data'])}B(q{loose['quality']}), "
+        f"tight={len(tight['data'])}B(q{tight['quality']})"
+    )
+
+
+def test_animated_keep_as_webp() -> None:
+    # gif 不在可接受列表 → 触发转码；keep_animated 应保留为动态 webp
+    data = _make_animated_gif_bytes((64, 64), frames=4)
+    result = fetch_plugin._normalize_image_blocking(
+        data,
+        acceptable_formats={"webp"},
+        convert_format="webp",
+        max_image_size=2 * 1024 * 1024,
+        max_dimension=2048,
+        quality_start=80,
+        quality_floor=10,
+        animated_policy="keep_animated",
+        max_animation_frames=512,
+    )
     assert result["converted"] is True
-    assert len(result["data"]) <= target, f"压缩结果 {len(result['data'])} 超过目标 {target}"
-    assert result["downscaled"] is True
-    print(f"ok: noisy image compressed to {len(result['data'])} bytes (target {target}), quality={result['quality']}")
+    assert result["format"] == "webp"
+    assert result["animation_preserved"] is True
+    with Image.open(BytesIO(result["data"])) as img:
+        assert img.format == "WEBP"
+        assert getattr(img, "n_frames", 1) > 1
+    print("ok: animated gif kept as animated webp")
+
+
+def test_animated_first_frame_policy() -> None:
+    data = _make_animated_gif_bytes((64, 64), frames=4)
+    result = fetch_plugin._normalize_image_blocking(
+        data,
+        acceptable_formats={"webp"},
+        convert_format="webp",
+        max_image_size=2 * 1024 * 1024,
+        max_dimension=2048,
+        quality_start=80,
+        quality_floor=10,
+        animated_policy="first_frame",
+    )
+    assert result["animation_preserved"] is False
+    with Image.open(BytesIO(result["data"])) as img:
+        assert getattr(img, "n_frames", 1) == 1
+    print("ok: first_frame policy flattens animation to a static frame")
+
+
+def test_animated_skip_policy_passthrough() -> None:
+    data = _make_animated_gif_bytes((64, 64), frames=4)
+    result = fetch_plugin._normalize_image_blocking(
+        data,
+        acceptable_formats={"webp"},
+        convert_format="webp",
+        max_image_size=2 * 1024 * 1024,
+        max_dimension=2048,
+        quality_start=80,
+        quality_floor=10,
+        animated_policy="skip",
+    )
+    assert result["converted"] is False
+    assert result["animation_preserved"] is True
+    assert result["data"] == data
+    print("ok: skip policy passes animated image through untouched")
+
+
+def test_animated_jpeg_target_degrades_to_first_frame() -> None:
+    # jpeg 无法承载动画，keep_animated 应优雅退化为首帧静态图
+    data = _make_animated_gif_bytes((64, 64), frames=4)
+    result = fetch_plugin._normalize_image_blocking(
+        data,
+        acceptable_formats={"webp"},
+        convert_format="jpeg",
+        max_image_size=2 * 1024 * 1024,
+        max_dimension=2048,
+        quality_start=80,
+        quality_floor=10,
+        animated_policy="keep_animated",
+    )
+    assert result["converted"] is True
+    assert result["format"] == "jpeg"
+    assert result["animation_preserved"] is False
+    with Image.open(BytesIO(result["data"])) as img:
+        assert img.format == "JPEG"
+    print("ok: jpeg target degrades animation to first frame")
 
 
 def test_alt_text_regex_and_sanitize() -> None:
@@ -281,7 +408,11 @@ def main() -> None:
     test_plugin_importable()
     test_image_passthrough()
     test_image_format_conversion()
-    test_image_compression_with_downscale()
+    test_image_compression_single_pass()
+    test_animated_keep_as_webp()
+    test_animated_first_frame_policy()
+    test_animated_skip_policy_passthrough()
+    test_animated_jpeg_target_degrades_to_first_frame()
     test_alt_text_regex_and_sanitize()
     with tempfile.TemporaryDirectory(dir=str(PLUGIN_DIR)) as tmp:
         test_alt_text_cache_persistence(Path(tmp))
