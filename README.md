@@ -16,23 +16,21 @@
 
 | 类型        | 处理方式                                      |
 | --------- | ----------------------------------------- |
-| `image/`* | 下载 → 校验 → 按需转码压缩 → 以 `content_items` 回传图像 |
+| `image/`* | 下载 → 校验 → 可接受格式原样回传 / 不支持格式转码 → 以 `content_items` 回传 |
 | PDF       | jina Reader 转 Markdown（本地解析器不支持 PDF）      |
 | HTML / 文本 | jina Reader（默认）或本地 markdownify            |
 
 
-### 图片转码与压缩
+### 直接抓取图片（入站 content_items）
 
-- 格式不在 `acceptable_formats`（默认 jpeg/png/gif/webp）内 → 转为 `convert_format`（默认 webp）
-- 大小超过 `max_image_size`（默认 2 MB）→ **单次压缩**（资源友好，不做多轮重压缩）：
-  1. 超大图先缩到 `max_dimension`（默认 2048 px）
-  2. 用小图试编码快速估算达到大小目标所需的质量（按 `q × sqrt(目标/实际)`，从 `quality_start`/默认 80 往下，下限 `quality_floor`/默认 10）
-  3. 质量压到下限仍不够时，在同一次估算里补一个缩放比例，随后**全尺寸只编码一次**
-  - 结果允许在目标附近上下浮动；png / gif 无质量可调，超标时直接按估算比例缩小尺寸
-- 动图（GIF 等多帧图片）由 `animated_policy`（默认 `keep_animated`）控制，保留逐帧时长与循环次数：
-  - `keep_animated` → 按目标格式编码（webp→动态 WebP，png→APNG，gif→动态 GIF）；目标为 jpeg、帧数超 `max_animation_frames`（默认 512）或编码后仍超标时，优雅退化为首帧静态图
-  - `skip` → 动图原样放行不压缩
-  - `first_frame` → 只保留首帧转静态图
+- 格式在 `acceptable_formats` 内 **且** 体积 ≤ `max_image_size`（默认 16 MB）**且** 最长边 ≤ `max_dimension`（默认 4096 px）→ 原样回传
+- 超过 `max_image_size` 或 `max_dimension` → **无论格式** 均按 `convert_format`（默认 webp）、`quality_start` 预处理编码，以 `max_image_size` 为体积目标，并预缩到 `max_dimension`
+- 不支持格式（如 BMP）→ 同上，始终预处理编码
+
+### VLM alt 图片压缩（`[alt_text.image]`，仅网页内嵌图送 VLM 描述）
+
+- 始终经体积估算单次压缩管道转码（默认 WebP、目标 1 MB、最长边 2048 px）
+- 动图由 `animated_policy`（默认 `keep_animated`）控制
 
 ### 超长内容窗口与总结
 
@@ -47,6 +45,7 @@
 替换优先级：**VLM 描述 > jina 生成的 alt（需配置 `jina.api_key` 且开启 `with_generated_alt`）> 网页原始 alt**。
 
 - 页面图片多于 `max_images`（默认 3）时，按 HEAD `Content-Length` 排序优先描述**最大**的几张（跳过最短边小于 `min_dimension` 的图标 / Logo）
+- 送入 VLM 前**始终**经体积估算单次压缩管道转码（由独立的 `[alt_text.image]` 配置，默认 WebP、目标 1 MB、最长边 2048 px）
 - 描述结果以图片内容 sha256 为键持久缓存在 `data/alt_text_cache.json`（LRU，默认 1024 条），重复抓取不再消耗 VLM 调用
 - VLM 任务未配置时自动跳过，保留 jina / 原始 alt
 - 直接抓取的单张图片无需此机制——MaiBot 主程序会自动为工具回传的图片生成并缓存描述
@@ -77,16 +76,21 @@
 | `jina.api_key`                           | （空）               | jina API Key（可选，不填有频率限制）       |
 | `jina.timeout`                           | 30                | jina 超时（秒），超时回退本地抓取            |
 | `jina.engine`                            | browser           | jina 渲染引擎（质量最好）                |
-| `image.acceptable_formats`               | jpeg/png/gif/webp | 可直接回传的图片格式                     |
-| `image.convert_format`                   | webp              | 转换目标格式                         |
-| `image.max_image_size`                   | 2 MB              | 回传图片大小上限（超过触发单次压缩）             |
-| `image.animated_policy`                  | keep_animated     | 动图策略：keep_animated/skip/first_frame |
-| `image.max_animation_frames`             | 512               | 保留动画的帧数上限（超过退化为首帧，0 不限）        |
+| `image.acceptable_formats`               | jpeg/png/gif/webp | 可原样回传的格式（须同时 ≤ max_image_size）   |
+| `image.convert_format`                   | webp              | 预处理编码目标格式                         |
+| `image.max_image_size`                   | 16 MB             | 原样回传上限；超过则一律预处理并以之为压缩目标       |
+| `image.max_dimension`                    | 4096              | 原样回传最长边上限；超过则预处理并预缩到该尺寸         |
 | `content.max_content_length`             | 8192              | 单次返回文本上限（字符）                   |
 | `content.llm_summarize`                  | true              | 超长内容是否 LLM 总结                  |
 | `llm.model`                              | planner           | 总结用的模型**任务名**（非原始模型 ID）        |
 | `alt_text.max_images`                    | 3                 | 每次抓取最多 VLM 描述的图片数（0 关闭）        |
 | `alt_text.cache_size`                    | 1024              | 持久描述缓存条目上限                     |
+| `alt_text.image.convert_format`          | webp              | VLM 输入转码目标格式                     |
+| `alt_text.image.target_image_size`       | 1 MB              | 体积估算目标（始终走估算算法）                |
+| `alt_text.image.max_dimension`           | 2048              | VLM 输入最长边上限                       |
+| `alt_text.image.max_quality`             | 80                | webp/jpeg 最高质量                       |
+| `alt_text.image.min_quality`             | 10                | webp/jpeg 最低质量                       |
+| `alt_text.image.animated_policy`         | keep_animated     | VLM 动图策略                           |
 
 
 > **安全提醒**：`fetch.cookies`、`fetch.domain_cookies`、`jina.api_key` 属于敏感信息，请勿提交到版本库。

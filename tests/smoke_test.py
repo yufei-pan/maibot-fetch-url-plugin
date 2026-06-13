@@ -19,6 +19,26 @@ sys.path.insert(0, str(PLUGIN_DIR))
 from PIL import Image  # noqa: E402
 
 import plugin as fetch_plugin  # noqa: E402
+from config_migrations import CURRENT_CONFIG_VERSION, normalize_fetch_url_config  # noqa: E402
+
+_INBOUND = dict(
+    acceptable_formats={"jpeg", "png", "gif", "webp"},
+    convert_format="webp",
+    max_image_size=16 * 1024 * 1024,
+    max_dimension=4096,
+    quality_start=80,
+    quality_floor=10,
+)
+
+_VLM = dict(
+    convert_format="webp",
+    target_image_size=1024 * 1024,
+    max_dimension=2048,
+    max_quality=80,
+    min_quality=10,
+    animated_policy="keep_animated",
+    max_animation_frames=512,
+)
 
 
 def _make_image_bytes(fmt: str, size: tuple[int, int], noisy: bool = False) -> bytes:
@@ -39,11 +59,7 @@ def _make_image_bytes(fmt: str, size: tuple[int, int], noisy: bool = False) -> b
 
 
 def _make_detailed_image_bytes(fmt: str, size: tuple[int, int]) -> bytes:
-    """生成可中等压缩的细节图：低分辨率噪声放大成平滑色块。
-
-    这类内容遵循 JPEG“体积近似随质量平方变化”的模型，单次质量估算在其上表现具有代表性
-    （纯随机噪声是任何单次估算器的病态输入，不适合用来校验单次压缩的目标贴合度）。
-    """
+    """生成可中等压缩的细节图。"""
     import random
 
     random.seed(11)
@@ -63,7 +79,7 @@ def _make_detailed_image_bytes(fmt: str, size: tuple[int, int]) -> bytes:
 
 
 def _make_animated_gif_bytes(size: tuple[int, int], frames: int = 4) -> bytes:
-    """生成多帧动画 GIF 字节（逐帧改变颜色）。"""
+    """生成多帧动画 GIF 字节。"""
     images = [Image.new("RGB", size, ((index * 60) % 256, 30, 200)) for index in range(frames)]
     buffer = BytesIO()
     images[0].save(
@@ -75,6 +91,71 @@ def _make_animated_gif_bytes(size: tuple[int, int], frames: int = 4) -> bytes:
         loop=0,
     )
     return buffer.getvalue()
+
+
+def test_config_migration_from_1_2_0() -> None:
+    """旧版默认应在升级时迁移到新默认，用户自定义值应保留。"""
+    default_config = fetch_plugin.FetchUrlConfig().model_dump(mode="python")
+    legacy = {
+        "plugin": {"enabled": True, "config_version": "1.2.0", "always_visible_for_planner": False},
+        "fetch": {"timeout": 15.0, "proxy": "", "max_download_size": 16777216},
+        "image": {
+            "acceptable_formats": ["jpeg", "png", "gif", "webp"],
+            "convert_format": "webp",
+            "max_image_size": 2097152,
+            "max_dimension": 2048,
+            "quality_start": 80,
+            "quality_floor": 10,
+            "animated_policy": "keep_animated",
+            "max_animation_frames": 512,
+        },
+    }
+    merged, changed, notes = normalize_fetch_url_config(legacy, default_config)
+    assert changed
+    assert merged["plugin"]["config_version"] == CURRENT_CONFIG_VERSION
+    assert merged["fetch"]["max_download_size"] == 64 * 1024 * 1024
+    assert merged["image"]["max_image_size"] == 16 * 1024 * 1024
+    assert merged["image"]["max_dimension"] == 4096
+    assert "animated_policy" not in merged["image"]
+    assert notes
+    print("ok: config migration 1.2.0 -> current defaults")
+
+    legacy_custom = {
+        **legacy,
+        "image": {**legacy["image"], "max_image_size": 5 * 1024 * 1024},
+    }
+    merged_custom, _, _ = normalize_fetch_url_config(legacy_custom, default_config)
+    assert merged_custom["image"]["max_image_size"] == 5 * 1024 * 1024
+    print("ok: customized max_image_size preserved during migration")
+
+
+def test_config_migration_alt_text_image_renames() -> None:
+    default_config = fetch_plugin.FetchUrlConfig().model_dump(mode="python")
+    legacy = {
+        "plugin": {"enabled": True, "config_version": "1.3.0", "always_visible_for_planner": False},
+        "alt_text": {
+            "max_images": 3,
+            "image": {
+                "convert_format": "webp",
+                "max_image_size": 524288,
+                "max_dimension": 1024,
+                "quality_start": 80,
+                "quality_floor": 10,
+                "animated_policy": "first_frame",
+                "max_animation_frames": 512,
+            },
+        },
+    }
+    merged, changed, notes = normalize_fetch_url_config(legacy, default_config)
+    assert changed
+    alt_image = merged["alt_text"]["image"]
+    assert alt_image["target_image_size"] == 1024 * 1024
+    assert alt_image["max_quality"] == 80
+    assert alt_image["min_quality"] == 10
+    assert alt_image["animated_policy"] == "keep_animated"
+    assert "max_image_size" not in alt_image
+    assert notes
+    print("ok: alt_text.image field renames and default bumps")
 
 
 def test_get_components_planner_visibility() -> None:
@@ -97,10 +178,14 @@ def test_plugin_importable() -> None:
     assert instance is not None
     default_config = type(instance).build_default_config()
     assert default_config["plugin"]["enabled"] is True
+    assert default_config["plugin"]["config_version"] == CURRENT_CONFIG_VERSION
     assert default_config["image"]["convert_format"] == "webp"
     assert default_config["alt_text"]["cache_size"] == 1024
+    assert default_config["alt_text"]["image"]["convert_format"] == "webp"
+    assert default_config["alt_text"]["image"]["target_image_size"] == 1024 * 1024
+    assert default_config["alt_text"]["image"]["animated_policy"] == "keep_animated"
+    assert "animated_policy" not in default_config["image"]
 
-    # config.toml 与配置模型字段一致（允许 config.toml 省略字段，不允许多出字段）
     config_data = tomllib.loads((PLUGIN_DIR / "config.toml").read_text(encoding="utf-8"))
     for section, fields in config_data.items():
         assert section in default_config, f"config.toml 中存在未知配置节：{section}"
@@ -109,145 +194,89 @@ def test_plugin_importable() -> None:
     print("ok: plugin importable, config model consistent")
 
 
-def test_image_passthrough() -> None:
+def test_inbound_passthrough_acceptable_format() -> None:
     data = _make_image_bytes("png", (64, 64))
-    result = fetch_plugin._normalize_image_blocking(
-        data,
-        acceptable_formats={"jpeg", "png", "gif", "webp"},
-        convert_format="webp",
-        max_image_size=2 * 1024 * 1024,
-        max_dimension=2048,
-        quality_start=80,
-        quality_floor=10,
-    )
+    result = fetch_plugin._normalize_inbound_image_blocking(data, **_INBOUND)
     assert result["converted"] is False
     assert result["data"] == data
     print("ok: acceptable small image passes through untouched")
 
 
-def test_image_format_conversion() -> None:
-    data = _make_image_bytes("bmp", (64, 64))
-    result = fetch_plugin._normalize_image_blocking(
+def test_inbound_preprocess_oversized_dimension() -> None:
+    # 体积与格式均可接受，但最长边超过 max_dimension → 预处理编码
+    data = _make_image_bytes("png", (3000, 2000))
+    result = fetch_plugin._normalize_inbound_image_blocking(
         data,
-        acceptable_formats={"jpeg", "png", "gif", "webp"},
-        convert_format="webp",
-        max_image_size=2 * 1024 * 1024,
-        max_dimension=2048,
-        quality_start=80,
-        quality_floor=10,
+        **{**_INBOUND, "max_dimension": 2048},
     )
+    assert result["converted"] is True
+    assert result["format"] == "webp"
+    assert max(result["width"], result["height"]) <= 2048
+    print("ok: oversized dimension preprocessed and downscaled")
+
+
+def test_inbound_preprocess_oversized_acceptable_format() -> None:
+    # 可接受格式但超过 max_image_size → 预处理编码
+    data = _make_image_bytes("png", (1200, 1200), noisy=True)
+    result = fetch_plugin._normalize_inbound_image_blocking(
+        data,
+        **{**_INBOUND, "max_image_size": 200 * 1024},
+    )
+    assert result["converted"] is True
+    assert result["format"] == "webp"
+    assert len(result["data"]) < len(data)
+    print("ok: oversized acceptable format preprocessed to webp")
+
+
+def test_inbound_format_conversion() -> None:
+    data = _make_image_bytes("bmp", (64, 64))
+    result = fetch_plugin._normalize_inbound_image_blocking(data, **_INBOUND)
     assert result["converted"] is True
     assert result["format"] == "webp"
     with Image.open(BytesIO(result["data"])) as img:
         assert img.format == "WEBP"
-    print("ok: unacceptable format converted to webp")
+    print("ok: unsupported format converted to webp")
 
 
-def test_image_compression_single_pass() -> None:
-    # 单次估算编码会预缩放到 max_dimension 并按估算质量一次成型。单次压缩不保证严格贴合目标
-    # （结果允许在目标附近上下浮动），但估算应对目标有单调响应：目标越紧 → 质量越低、体积越小。
-    data = _make_detailed_image_bytes("png", (1600, 1200))
-    common = dict(
-        acceptable_formats={"jpeg", "png", "gif", "webp"},
-        convert_format="jpeg",
-        max_dimension=1024,
-        quality_start=80,
-        quality_floor=10,
-    )
-    loose = fetch_plugin._normalize_image_blocking(data, max_image_size=200 * 1024, **common)
-    tight = fetch_plugin._normalize_image_blocking(data, max_image_size=12 * 1024, **common)
+def test_vlm_prepare_always_compresses() -> None:
+    data = _make_image_bytes("png", (256, 256))
+    passthrough = fetch_plugin._normalize_inbound_image_blocking(data, **_INBOUND)
+    assert passthrough["converted"] is False
 
-    # 行为：均触发转码并预缩放到 max_dimension，且远小于原始 PNG 体积
-    assert loose["converted"] is True and tight["converted"] is True
-    assert loose["downscaled"] is True and tight["downscaled"] is True
-    assert len(tight["data"]) < len(data)
-    # 单次估算对目标有单调响应：更紧的目标产出更低的质量与更小的体积
-    assert tight["quality"] is not None and tight["quality"] < 80
-    assert len(tight["data"]) < len(loose["data"])
-    print(
-        f"ok: single-pass responds to target — loose={len(loose['data'])}B(q{loose['quality']}), "
-        f"tight={len(tight['data'])}B(q{tight['quality']})"
-    )
+    payload = fetch_plugin._prepare_vlm_image_blocking(data, min_dimension=64, **_VLM)
+    assert payload is not None
+    assert payload["format"] == "webp"
+    with Image.open(BytesIO(__import__("base64").b64decode(payload["base64"]))) as img:
+        assert img.format == "WEBP"
+    print("ok: VLM prepare always compresses via vlm pipeline")
 
 
-def test_animated_keep_as_webp() -> None:
-    # gif 不在可接受列表 → 触发转码；keep_animated 应保留为动态 webp
+def test_vlm_prepare_skips_small_icons() -> None:
+    data = _make_image_bytes("png", (32, 32))
+    payload = fetch_plugin._prepare_vlm_image_blocking(data, min_dimension=128, **_VLM)
+    assert payload is None
+    print("ok: VLM prepare skips icons below min_dimension")
+
+
+def test_vlm_animated_keep_as_webp() -> None:
     data = _make_animated_gif_bytes((64, 64), frames=4)
-    result = fetch_plugin._normalize_image_blocking(
-        data,
-        acceptable_formats={"webp"},
-        convert_format="webp",
-        max_image_size=2 * 1024 * 1024,
-        max_dimension=2048,
-        quality_start=80,
-        quality_floor=10,
-        animated_policy="keep_animated",
-        max_animation_frames=512,
-    )
+    result = fetch_plugin._normalize_vlm_image_blocking(data, **_VLM)
     assert result["converted"] is True
     assert result["format"] == "webp"
     assert result["animation_preserved"] is True
     with Image.open(BytesIO(result["data"])) as img:
         assert img.format == "WEBP"
         assert getattr(img, "n_frames", 1) > 1
-    print("ok: animated gif kept as animated webp")
+    print("ok: VLM animated gif kept as animated webp")
 
 
-def test_animated_first_frame_policy() -> None:
+def test_vlm_animated_first_frame_policy() -> None:
     data = _make_animated_gif_bytes((64, 64), frames=4)
-    result = fetch_plugin._normalize_image_blocking(
-        data,
-        acceptable_formats={"webp"},
-        convert_format="webp",
-        max_image_size=2 * 1024 * 1024,
-        max_dimension=2048,
-        quality_start=80,
-        quality_floor=10,
-        animated_policy="first_frame",
-    )
+    result = fetch_plugin._normalize_vlm_image_blocking(data, **{**_VLM, "animated_policy": "first_frame"})
     assert result["animation_preserved"] is False
     with Image.open(BytesIO(result["data"])) as img:
         assert getattr(img, "n_frames", 1) == 1
-    print("ok: first_frame policy flattens animation to a static frame")
-
-
-def test_animated_skip_policy_passthrough() -> None:
-    data = _make_animated_gif_bytes((64, 64), frames=4)
-    result = fetch_plugin._normalize_image_blocking(
-        data,
-        acceptable_formats={"webp"},
-        convert_format="webp",
-        max_image_size=2 * 1024 * 1024,
-        max_dimension=2048,
-        quality_start=80,
-        quality_floor=10,
-        animated_policy="skip",
-    )
-    assert result["converted"] is False
-    assert result["animation_preserved"] is True
-    assert result["data"] == data
-    print("ok: skip policy passes animated image through untouched")
-
-
-def test_animated_jpeg_target_degrades_to_first_frame() -> None:
-    # jpeg 无法承载动画，keep_animated 应优雅退化为首帧静态图
-    data = _make_animated_gif_bytes((64, 64), frames=4)
-    result = fetch_plugin._normalize_image_blocking(
-        data,
-        acceptable_formats={"webp"},
-        convert_format="jpeg",
-        max_image_size=2 * 1024 * 1024,
-        max_dimension=2048,
-        quality_start=80,
-        quality_floor=10,
-        animated_policy="keep_animated",
-    )
-    assert result["converted"] is True
-    assert result["format"] == "jpeg"
-    assert result["animation_preserved"] is False
-    with Image.open(BytesIO(result["data"])) as img:
-        assert img.format == "JPEG"
-    print("ok: jpeg target degrades animation to first frame")
+    print("ok: VLM first_frame policy flattens animation")
 
 
 def test_alt_text_regex_and_sanitize() -> None:
@@ -265,7 +294,7 @@ def test_alt_text_cache_persistence(tmp_dir: Path) -> None:
     cache = fetch_plugin.AltTextCache(cache_path, max_entries=2)
     cache.put("k1", "desc1")
     cache.put("k2", "desc2")
-    cache.put("k3", "desc3")  # 淘汰 k1
+    cache.put("k3", "desc3")
     cache._flush()
     assert cache.get("k1") is None
     assert cache.get("k3") == "desc3"
@@ -333,7 +362,7 @@ def test_windowing_semantics() -> None:
     instance = fetch_plugin.create_plugin()
     instance._max_content_length = 100
     instance._llm_summarize = True
-    instance._alt_max_images = 0  # 跳过 VLM 路径
+    instance._alt_max_images = 0
 
     summarize_calls: list[str] = []
 
@@ -342,10 +371,9 @@ def test_windowing_semantics() -> None:
         return "这是摘要"
 
     instance._summarize = fake_summarize  # type: ignore[method-assign]
-    document = "abcdefghij" * 50  # 500 字符
+    document = "abcdefghij" * 50
 
     async def run() -> None:
-        # 1. 全文超限 + 默认 summarize → 摘要
         result = await instance._build_text_result(
             markdown=document, provider="jina", url="https://e.com", final_url="https://e.com",
             start_char=0, end_char=-1, on_exceed="summarize", summary_focus="",
@@ -355,16 +383,14 @@ def test_windowing_semantics() -> None:
         assert "这是摘要" in result["content"]
         assert len(summarize_calls) == 1 and len(summarize_calls[0]) == 500
 
-        # 2. 显式 truncate → 截断原文，不调用 LLM
         result = await instance._build_text_result(
             markdown=document, provider="jina", url="https://e.com", final_url="https://e.com",
             start_char=0, end_char=-1, on_exceed="truncate", summary_focus="",
         )
         assert result["processed"] == "truncated"
         assert result["returned_range"] == [0, 100]
-        assert len(summarize_calls) == 1  # 未新增调用
+        assert len(summarize_calls) == 1
 
-        # 3. 自定义窗口小于上限 → 原文完整返回
         result = await instance._build_text_result(
             markdown=document, provider="jina", url="https://e.com", final_url="https://e.com",
             start_char=100, end_char=180, on_exceed="summarize", summary_focus="",
@@ -373,7 +399,6 @@ def test_windowing_semantics() -> None:
         assert document[100:180] in result["content"]
         assert result["returned_range"] == [100, 180]
 
-        # 4. 自定义窗口大于上限 + summarize → 只总结该窗口
         result = await instance._build_text_result(
             markdown=document, provider="jina", url="https://e.com", final_url="https://e.com",
             start_char=100, end_char=400, on_exceed="summarize", summary_focus="",
@@ -381,7 +406,6 @@ def test_windowing_semantics() -> None:
         assert result["processed"] == "summarized"
         assert len(summarize_calls) == 2 and len(summarize_calls[1]) == 300
 
-        # 5. llm_summarize 关闭 → 即使要求 summarize 也截断
         instance._llm_summarize = False
         result = await instance._build_text_result(
             markdown=document, provider="jina", url="https://e.com", final_url="https://e.com",
@@ -390,7 +414,6 @@ def test_windowing_semantics() -> None:
         assert result["processed"] == "truncated"
         assert len(summarize_calls) == 2
 
-        # 6. 空窗口 → 友好提示
         result = await instance._build_text_result(
             markdown=document, provider="jina", url="https://e.com", final_url="https://e.com",
             start_char=900, end_char=-1, on_exceed="summarize", summary_focus="",
@@ -406,13 +429,16 @@ def main() -> None:
 
     test_get_components_planner_visibility()
     test_plugin_importable()
-    test_image_passthrough()
-    test_image_format_conversion()
-    test_image_compression_single_pass()
-    test_animated_keep_as_webp()
-    test_animated_first_frame_policy()
-    test_animated_skip_policy_passthrough()
-    test_animated_jpeg_target_degrades_to_first_frame()
+    test_config_migration_from_1_2_0()
+    test_config_migration_alt_text_image_renames()
+    test_inbound_passthrough_acceptable_format()
+    test_inbound_preprocess_oversized_dimension()
+    test_inbound_preprocess_oversized_acceptable_format()
+    test_inbound_format_conversion()
+    test_vlm_prepare_always_compresses()
+    test_vlm_prepare_skips_small_icons()
+    test_vlm_animated_keep_as_webp()
+    test_vlm_animated_first_frame_policy()
     test_alt_text_regex_and_sanitize()
     with tempfile.TemporaryDirectory(dir=str(PLUGIN_DIR)) as tmp:
         test_alt_text_cache_persistence(Path(tmp))

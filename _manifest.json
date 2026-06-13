@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "com.0-hz.fetch-url",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "name": "Fetch URL",
-  "description": "提供 fetch_url 工具：抓取任意 URL，网页 / PDF 通过 jina.ai Reader（或本地 markdownify 兜底）转为 Markdown，图片自动转码压缩后直接回传给麦麦观察。支持分页读取、超长内容 LLM 总结、VLM 图片描述替换 alt 文本。",
+  "description": "提供 fetch_url 工具：抓取任意 URL，网页 / PDF 通过 jina.ai Reader（或本地 markdownify 兜底）转为 Markdown，图片按入站/VLM 双路径处理后直接回传给麦麦观察。支持分页读取、超长内容 LLM 总结、VLM 图片描述替换 alt 文本。",
   "author": {
     "name": "kes",
     "url": "https://github.com/yufei-pan"

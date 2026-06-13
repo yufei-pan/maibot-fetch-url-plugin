@@ -2,7 +2,7 @@
 
 提供单一 ``fetch_url`` 工具：
 - 网页 / PDF：优先通过 jina.ai Reader 转 Markdown，失败时回退到本地抓取 + markdownify；
-- 图片：下载后按配置转码 / 压缩，通过 ``content_items`` 直接回传给麦麦观察；
+- 图片：下载后仅对不支持格式转码；可接受格式原样回传（体积压缩交由 image-recompress 等入站插件）
 - 支持 start_char / end_char 分页窗口、超长内容 LLM 总结（注入人设）或截断；
 - 网页中的图片可由 VLM 生成描述并替换 alt 文本（优先级：VLM > jina 生成 alt > 原始 alt）。
 """
@@ -19,6 +19,7 @@ from collections import OrderedDict
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
@@ -28,7 +29,10 @@ from markdownify import markdownify as html_to_markdown
 from PIL import Image, ImageOps, ImageSequence
 
 from maibot_sdk import Field, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk.config import validate_plugin_config
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
+
+from config_migrations import CURRENT_CONFIG_VERSION, normalize_fetch_url_config
 
 # --------------------------------------------------------------------------- #
 # 常量
@@ -53,11 +57,15 @@ _PDF_MAGIC = b"%PDF"
 # Markdown 图片语法：![alt](src "title")
 _MD_IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]\n]*)\]\(\s*(?P<src>[^)\s]+)(?P<title>\s+\"[^\"]*\")?\s*\)")
 
-# 质量估算用的试编码像素数上限（编码耗时大致与像素数成正比，
+# 直接抓取图片（入站 content_items）的质量搜索 / 尺寸缩放迭代上限
+_MAX_INBOUND_QUALITY_ITERATIONS = 6
+_MAX_INBOUND_DOWNSCALE_ITERATIONS = 8
+
+# VLM alt 体积估算用的试编码像素数上限（编码耗时大致与像素数成正比，
 # 试编码成本仅为全尺寸压缩的几个百分点）
 _PROBE_MAX_PIXELS = 65536
 
-# 单次估算模式的目标比例：估算目标 = max_image_size × 该比例，预留些许上下浮动空间
+# VLM 单次估算模式的目标比例：估算目标 = target_image_size × 该比例，预留些许上下浮动空间
 _SINGLE_PASS_TARGET_RATIO = 0.9
 
 # 动图帧缺省时长（毫秒），与 Pillow 对 GIF 的常见缺省值一致
@@ -72,9 +80,6 @@ _VALID_ANIMATED_POLICIES = ("keep_animated", "skip", "first_frame")
 # HEAD 排序候选图片数量上限与并发数
 _ALT_TEXT_HEAD_CANDIDATE_LIMIT = 50
 _ALT_TEXT_HEAD_CONCURRENCY = 8
-
-# 送入 VLM 的图片最长边（内部约束，避免撑爆视觉模型负载）
-_VLM_INPUT_MAX_EDGE = 1024
 
 # LLM 总结时允许送入的最大字符数（防止 prompt 超过模型上下文）
 _MAX_SUMMARIZE_INPUT_CHARS = 60000
@@ -186,6 +191,183 @@ def _coerce_rgb_like(image: Image.Image) -> Image.Image:
     return image.convert("RGBA" if "A" in image.getbands() else "RGB")
 
 
+def _encode_inbound_image(
+    image: Image.Image,
+    fmt: str,
+    quality: int | None,
+    *,
+    keep_animation: bool = False,
+    animation_source: Image.Image | None = None,
+) -> bytes:
+    """将图片编码为目标格式字节（直接抓取入站路径）。"""
+    buffer = BytesIO()
+    if fmt == "jpeg":
+        _flatten_for_jpeg(image).save(buffer, format="JPEG", quality=quality or 80, optimize=True)
+    elif fmt == "webp":
+        if keep_animation and animation_source is not None:
+            animation_source.save(buffer, format="WEBP", save_all=True, quality=quality or 80)
+        else:
+            _coerce_rgb_like(image).save(buffer, format="WEBP", quality=quality or 80, method=4)
+    elif fmt == "png":
+        _coerce_rgb_like(image).save(buffer, format="PNG", optimize=True)
+    elif fmt == "gif":
+        if keep_animation and animation_source is not None:
+            animation_source.save(buffer, format="GIF", save_all=True)
+        else:
+            image.convert("RGB").save(buffer, format="GIF")
+    else:
+        raise FetchUrlError(f"不支持的转换目标格式：{fmt}")
+    return buffer.getvalue()
+
+
+def _adaptive_quality_search_inbound(
+    image: Image.Image,
+    fmt: str,
+    target_size: int,
+    quality_start: int,
+    quality_floor: int,
+    *,
+    keep_animation: bool = False,
+    animation_source: Image.Image | None = None,
+) -> tuple[bytes, int, bool]:
+    """入站路径自适应质量搜索：按 ``q × sqrt(target/actual)`` 启发式跳跃。
+
+    Returns:
+        (编码结果, 最终质量, 是否满足大小目标)
+    """
+    quality = max(quality_floor, min(100, quality_start))
+    encoded = b""
+    for _ in range(_MAX_INBOUND_QUALITY_ITERATIONS):
+        encoded = _encode_inbound_image(
+            image, fmt, quality, keep_animation=keep_animation, animation_source=animation_source
+        )
+        if len(encoded) <= target_size:
+            return encoded, quality, True
+        if quality <= quality_floor:
+            break
+        estimated = int(quality * math.sqrt(target_size / len(encoded)))
+        quality = max(quality_floor, min(quality - 5, estimated))
+    return encoded, quality, False
+
+
+def _normalize_inbound_image_blocking(
+    data: bytes,
+    *,
+    acceptable_formats: set[str],
+    convert_format: str,
+    max_image_size: int,
+    max_dimension: int,
+    quality_start: int,
+    quality_floor: int,
+) -> dict[str, Any]:
+    """直接抓取图片 URL 时的转码 / 预处理（入站 content_items 路径）。
+
+    同时满足「格式在 ``acceptable_formats`` 内」「体积 ≤ ``max_image_size``」
+    「最长边 ≤ ``max_dimension``」时原样回传；否则按 ``convert_format``、
+    ``quality_start`` / ``quality_floor`` 预处理编码，以 ``max_image_size`` 为体积目标，
+    并遵守 ``max_dimension`` 预缩放。
+    """
+    with Image.open(BytesIO(data)) as probe:
+        probe.verify()
+
+    image = Image.open(BytesIO(data))
+    image.load()
+    src_format = _normalize_image_format(image.format or "")
+    animated = getattr(image, "n_frames", 1) > 1
+    within_dimension = max_dimension <= 0 or max(image.size) <= max_dimension
+
+    if src_format in acceptable_formats and len(data) <= max_image_size and within_dimension:
+        return {
+            "data": data,
+            "format": src_format,
+            "width": image.width,
+            "height": image.height,
+            "converted": False,
+            "quality": None,
+            "downscaled": False,
+            "animation_preserved": animated,
+            "original_format": src_format,
+            "original_size": len(data),
+        }
+
+    target_fmt = convert_format
+    keep_animation = animated and target_fmt in {"webp", "gif"}
+    work = image
+    if animated:
+        image.seek(0)
+        work = image.copy()
+    downscaled = False
+
+    if max(work.size) > max_dimension:
+        work = _resize_keep_aspect(work, max_dimension / max(work.size))
+        keep_animation = False
+        downscaled = True
+
+    final_quality: int | None = None
+    if target_fmt in {"webp", "jpeg"}:
+        encoded, final_quality, fits = _adaptive_quality_search_inbound(
+            work,
+            target_fmt,
+            max_image_size,
+            quality_start,
+            quality_floor,
+            keep_animation=keep_animation,
+            animation_source=image if keep_animation else None,
+        )
+        if keep_animation and not fits:
+            keep_animation = False
+            encoded, final_quality, fits = _adaptive_quality_search_inbound(
+                work, target_fmt, max_image_size, quality_start, quality_floor
+            )
+    else:
+        encoded = _encode_inbound_image(
+            work,
+            target_fmt,
+            None,
+            keep_animation=keep_animation,
+            animation_source=image if keep_animation else None,
+        )
+        fits = len(encoded) <= max_image_size
+
+    for _ in range(_MAX_INBOUND_DOWNSCALE_ITERATIONS):
+        if fits:
+            break
+        factor = math.sqrt(max_image_size / len(encoded))
+        factor = max(0.3, min(0.95, factor))
+        if min(work.size) <= 16:
+            break
+        keep_animation = False
+        work = _resize_keep_aspect(work, factor)
+        downscaled = True
+        if target_fmt in {"webp", "jpeg"}:
+            encoded = _encode_inbound_image(work, target_fmt, quality_floor)
+            final_quality = quality_floor
+        else:
+            encoded = _encode_inbound_image(work, target_fmt, None)
+        fits = len(encoded) <= max_image_size
+
+    with Image.open(BytesIO(encoded)) as output_probe:
+        output_width, output_height = output_probe.size
+
+    return {
+        "data": encoded,
+        "format": target_fmt,
+        "width": output_width,
+        "height": output_height,
+        "converted": True,
+        "quality": final_quality,
+        "downscaled": downscaled,
+        "animation_preserved": keep_animation,
+        "original_format": src_format or "unknown",
+        "original_size": len(data),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# VLM alt 图片压缩（体积估算单次编码，与入站路径独立）
+# --------------------------------------------------------------------------- #
+
+
 def _prepare_static_frame(image: Image.Image, fmt: str) -> Image.Image:
     """把静态图（或动图首帧）整理为适合目标格式编码的模式。
 
@@ -204,8 +386,8 @@ def _quality_adjustable(fmt: str) -> bool:
     return fmt in {"webp", "jpeg"}
 
 
-def _encode_image(image: Image.Image, fmt: str, quality: int | None) -> bytes:
-    """将单帧静态图编码为目标格式字节（png / gif 忽略 quality）。"""
+def _encode_static_image(image: Image.Image, fmt: str, quality: int | None) -> bytes:
+    """将单帧静态图编码为目标格式字节（VLM 路径；png / gif 忽略 quality）。"""
     buffer = BytesIO()
     if fmt == "jpeg":
         _flatten_for_jpeg(image).save(buffer, format="JPEG", quality=quality or 80, optimize=True)
@@ -300,7 +482,7 @@ def _estimate_quality_and_scale(
     probe = image
     if pixels > _PROBE_MAX_PIXELS:
         probe = _resize_keep_aspect(image, math.sqrt(_PROBE_MAX_PIXELS / pixels))
-    probe_encoded = _encode_image(probe, fmt, quality_start)
+    probe_encoded = _encode_static_image(probe, fmt, quality_start)
     estimated_full = len(probe_encoded) * pixels / (probe.width * probe.height)
 
     if estimated_full <= target_size:
@@ -321,65 +503,46 @@ def _estimate_quality_and_scale(
     return quality_floor, max(0.1, min(1.0, scale))
 
 
-def _encode_static_pipeline(
+def _encode_vlm_static_pipeline(
     image: Image.Image,
     fmt: str,
-    orig_size: int,
-    max_image_size: int,
     max_dimension: int,
-    quality_start: int,
-    quality_floor: int,
+    max_quality: int,
+    min_quality: int,
+    target_image_size: int,
 ) -> tuple[bytes, int | None, bool]:
-    """静态图单次编码管线：模式整理 → 超大图预缩放 → 质量估算后单次编码。
-
-    全程最多一次小图试编码 + 一次全尺寸编码，不做多轮“质量搜索 / 缩放”循环。
-
-    Returns:
-        ``(编码结果, 最终质量或 None, 是否缩小过尺寸)``。
-    """
+    """VLM 静态图单次编码：预缩放 → 始终按 ``target_image_size`` 体积估算编码。"""
     prepared = _prepare_static_frame(image, fmt)
     downscaled = False
-    # 预缩放：超大图先压到 max_dimension，避免在高质量大图上浪费压缩计算
     if max_dimension > 0 and max(prepared.size) > max_dimension:
         prepared = _resize_keep_aspect(prepared, max_dimension / max(prepared.size))
         downscaled = True
 
     adjustable = _quality_adjustable(fmt)
-    # 原图未超过阈值时单次最高质量转码即可
-    if orig_size <= max_image_size:
-        quality = quality_start if adjustable else None
-        return _encode_image(prepared, fmt, quality), quality, downscaled
-
-    # 估算质量（png / gif 则估算缩放比例）后全尺寸单次编码，允许结果在目标附近上下浮动
-    target_size = int(max_image_size * _SINGLE_PASS_TARGET_RATIO)
-    quality, scale = _estimate_quality_and_scale(prepared, fmt, target_size, quality_start, quality_floor)
+    target_size = int(target_image_size * _SINGLE_PASS_TARGET_RATIO)
+    quality, scale = _estimate_quality_and_scale(prepared, fmt, target_size, max_quality, min_quality)
     if scale < 1.0:
         prepared = _resize_keep_aspect(prepared, scale)
         downscaled = True
-    return _encode_image(prepared, fmt, quality if adjustable else None), (quality if adjustable else None), downscaled
+    return (
+        _encode_static_image(prepared, fmt, quality if adjustable else None),
+        quality if adjustable else None,
+        downscaled,
+    )
 
 
-def _normalize_image_blocking(
+def _normalize_vlm_image_blocking(
     data: bytes,
     *,
-    acceptable_formats: set[str],
     convert_format: str,
-    max_image_size: int,
+    target_image_size: int,
     max_dimension: int,
-    quality_start: int,
-    quality_floor: int,
-    animated_policy: str = "keep_animated",
-    max_animation_frames: int = 512,
+    max_quality: int,
+    min_quality: int,
+    animated_policy: str,
+    max_animation_frames: int,
 ) -> dict[str, Any]:
-    """校验并按需转码 / 压缩图片（阻塞实现，单次压缩策略）。
-
-    静态图走 :func:`_encode_static_pipeline` 单次估算编码；动图按 ``animated_policy``
-    决定保留动画（webp→动态 WebP / png→APNG / gif→动态 GIF）、原样放行或只取首帧。
-
-    Returns:
-        dict: ``{"data", "format", "width", "height", "converted", "quality",
-        "downscaled", "animation_preserved", "original_format", "original_size"}``
-    """
+    """VLM alt 图片描述前的转码 / 压缩（始终走体积估算，配置见 ``[alt_text.image]``）。"""
     with Image.open(BytesIO(data)) as probe:
         probe.verify()
 
@@ -387,40 +550,8 @@ def _normalize_image_blocking(
     image.load()
     src_format = _normalize_image_format(image.format or "")
     is_animated = bool(getattr(image, "is_animated", False)) and getattr(image, "n_frames", 1) > 1
-
-    # 源格式已可直接回传且大小达标 → 原样放行
-    if src_format in acceptable_formats and len(data) <= max_image_size:
-        return {
-            "data": data,
-            "format": src_format,
-            "width": image.width,
-            "height": image.height,
-            "converted": False,
-            "quality": None,
-            "downscaled": False,
-            "animation_preserved": is_animated,
-            "original_format": src_format,
-            "original_size": len(data),
-        }
-
     target_fmt = convert_format
 
-    # 动图按策略处理；skip 直接原样放行，不做任何重编码
-    if is_animated and animated_policy == "skip":
-        return {
-            "data": data,
-            "format": src_format,
-            "width": image.width,
-            "height": image.height,
-            "converted": False,
-            "quality": None,
-            "downscaled": False,
-            "animation_preserved": True,
-            "original_format": src_format,
-            "original_size": len(data),
-        }
-
-    # 是否保留动画：策略允许 + 目标格式能承载 + 帧数未超上限
     keep_animation = is_animated and animated_policy == "keep_animated" and target_fmt in _ANIMATED_CAPABLE_FORMATS
     if keep_animation and max_animation_frames > 0:
         frame_count = getattr(image, "n_frames", 1)
@@ -428,9 +559,8 @@ def _normalize_image_blocking(
             keep_animation = False
 
     if keep_animation:
-        encoded = _encode_animated(image, target_fmt, quality_start)
-        # 单次动图编码后仍超标 → 优雅退化为首帧静态图继续压缩
-        if len(encoded) <= max_image_size:
+        encoded = _encode_animated(image, target_fmt, max_quality)
+        if len(encoded) <= target_image_size:
             with Image.open(BytesIO(encoded)) as output_probe:
                 output_width, output_height = output_probe.size
             return {
@@ -439,19 +569,18 @@ def _normalize_image_blocking(
                 "width": output_width,
                 "height": output_height,
                 "converted": True,
-                "quality": quality_start if _quality_adjustable(target_fmt) else None,
+                "quality": max_quality if _quality_adjustable(target_fmt) else None,
                 "downscaled": False,
                 "animation_preserved": True,
                 "original_format": src_format or "unknown",
                 "original_size": len(data),
             }
 
-    # 静态路径：非动图 / first_frame 策略 / 动图保留失败时的首帧回退
     if is_animated:
         image.seek(0)
 
-    encoded, final_quality, downscaled = _encode_static_pipeline(
-        image, target_fmt, len(data), max_image_size, max_dimension, quality_start, quality_floor
+    encoded, final_quality, downscaled = _encode_vlm_static_pipeline(
+        image, target_fmt, max_dimension, max_quality, min_quality, target_image_size
     )
 
     with Image.open(BytesIO(encoded)) as output_probe:
@@ -471,33 +600,57 @@ def _normalize_image_blocking(
     }
 
 
-def _prepare_vlm_image_blocking(data: bytes, min_dimension: int) -> dict[str, Any] | None:
-    """为 VLM 输入准备图片：首帧、RGB、长边压到 1024、JPEG q80（阻塞实现）。
+def _prepare_vlm_image_blocking(
+    data: bytes,
+    min_dimension: int,
+    *,
+    convert_format: str,
+    target_image_size: int,
+    max_dimension: int,
+    max_quality: int,
+    min_quality: int,
+    animated_policy: str,
+    max_animation_frames: int,
+) -> dict[str, Any] | None:
+    """为 VLM 输入准备图片：经体积估算单次压缩管道转码后回传 base64。
+
+    由 ``[alt_text.image]`` 独立配置；始终经 :func:`_normalize_vlm_image_blocking` 体积估算压缩。
 
     Returns:
         dict | None: ``{"base64", "format", "width", "height"}``；
-        图片无效或尺寸小于 ``min_dimension``（疑似图标）时返回 ``None``。
+        图片无效或最短边小于 ``min_dimension``（疑似图标）时返回 ``None``。
     """
     try:
         with Image.open(BytesIO(data)) as probe:
             probe.verify()
-        image = Image.open(BytesIO(data))
-        image.load()
+        with Image.open(BytesIO(data)) as image:
+            image.load()
+            width, height = image.size
     except Exception:
         return None
 
-    width, height = image.size
     if min(width, height) < min_dimension:
         return None
 
-    if max(image.size) > _VLM_INPUT_MAX_EDGE:
-        image = _resize_keep_aspect(image, _VLM_INPUT_MAX_EDGE / max(image.size))
-    encoded = _encode_image(image, "jpeg", 80)
+    try:
+        info = _normalize_vlm_image_blocking(
+            data,
+            convert_format=convert_format,
+            target_image_size=target_image_size,
+            max_dimension=max_dimension,
+            max_quality=max_quality,
+            min_quality=min_quality,
+            animated_policy=animated_policy,
+            max_animation_frames=max_animation_frames,
+        )
+    except (FetchUrlError, Exception):
+        return None
+
     return {
-        "base64": b64encode(encoded).decode("ascii"),
-        "format": "jpeg",
-        "width": width,
-        "height": height,
+        "base64": b64encode(info["data"]).decode("ascii"),
+        "format": info["format"],
+        "width": info["width"],
+        "height": info["height"],
     }
 
 
@@ -607,7 +760,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.2.0", description="配置版本")
+    config_version: str = Field(default=CURRENT_CONFIG_VERSION, description="配置版本")
     always_visible_for_planner: bool = Field(
         default=False,
         description=(
@@ -631,8 +784,8 @@ class FetchSectionConfig(PluginConfigBase):
     )
     user_agent: str = Field(default=DEFAULT_USER_AGENT, description="抓取时使用的 User-Agent。")
     max_download_size: int = Field(
-        default=16 * 1024 * 1024,
-        description="单次下载的最大字节数（默认 16 MB），超过即中止并报错。",
+        default=64 * 1024 * 1024,
+        description="单次下载的最大字节数（默认 64 MB），超过即中止并报错。",
     )
     allow_private_networks: bool = Field(
         default=False,
@@ -684,7 +837,7 @@ class JinaSectionConfig(PluginConfigBase):
 
 
 class ImageSectionConfig(PluginConfigBase):
-    """图片转码 / 压缩相关配置。"""
+    """直接抓取图片 URL 时的入站转码 / 预处理配置。"""
 
     __ui_label__ = "图片"
     __ui_icon__ = "image"
@@ -692,39 +845,30 @@ class ImageSectionConfig(PluginConfigBase):
 
     acceptable_formats: list[str] = Field(
         default_factory=lambda: ["jpeg", "png", "gif", "webp"],
-        description="可直接回传的图片格式列表；不在列表内的格式会转换为 convert_format。",
+        description="可直接原样回传的图片格式；不在列表内或超过 max_image_size 时触发预处理编码。",
     )
     convert_format: str = Field(
         default="webp",
-        description="转换目标格式，可选 webp / jpeg / png / gif。",
+        description="预处理编码的目标格式，可选 webp / jpeg / png / gif。",
     )
     max_image_size: int = Field(
-        default=2 * 1024 * 1024,
-        description="回传图片的最大字节数（默认 2 MB），超过会触发压缩。",
+        default=16 * 1024 * 1024,
+        description=(
+            "原样回传的体积上限（默认 16 MB）。超过则无论格式一律按 convert_format 预处理编码，"
+            "并以该值为体积压缩目标；不支持格式转码时同理。"
+        ),
     )
     max_dimension: int = Field(
-        default=2048,
-        description="压缩时的最长边上限（像素）；超大图会先缩到该尺寸再做质量搜索。",
+        default=4096,
+        description="原样回传的最长边上限（像素，默认 4096）；超过则触发预处理编码，编码时也会预缩到该尺寸。",
     )
     quality_start: int = Field(
         default=80,
-        description="webp / jpeg 压缩的初始质量。",
+        description="预处理编码时 webp / jpeg 的初始质量。",
     )
     quality_floor: int = Field(
         default=10,
-        description="webp / jpeg 压缩的最低质量；到达下限仍超标时改为缩小图片尺寸。",
-    )
-    animated_policy: str = Field(
-        default="keep_animated",
-        description=(
-            "动图（GIF 等多帧图片）处理策略：keep_animated=保留动画并按目标格式编码"
-            "（webp→动态 WebP，png→APNG，gif→动态 GIF）；skip=动图原样放行不压缩；"
-            "first_frame=只保留首帧转静态图。目标格式为 jpeg（无法承载动画）时自动退化为首帧。"
-        ),
-    )
-    max_animation_frames: int = Field(
-        default=512,
-        description="保留动画时的帧数上限，超过则退化为首帧静态图（防止超长 GIF 编码耗时过久）；0 表示不限制。",
+        description="预处理编码时 webp / jpeg 的最低质量；到达下限仍超标时改为缩小图片尺寸。",
     )
 
 
@@ -773,6 +917,46 @@ class LLMSectionConfig(PluginConfigBase):
     )
 
 
+class AltTextImageSectionConfig(PluginConfigBase):
+    """VLM alt 图片描述前的图片转码 / 压缩配置（与 ``[image]`` 独立，共用同一压缩管道）。"""
+
+    __ui_label__ = "VLM 图片压缩"
+    __ui_icon__ = "image"
+    __ui_order__ = 0
+
+    convert_format: str = Field(
+        default="webp",
+        description="送入 VLM 前的转换目标格式，可选 webp / jpeg / png / gif。",
+    )
+    target_image_size: int = Field(
+        default=1024 * 1024,
+        description="体积估算算法的目标字节数（默认 1 MB）；输出允许在目标附近上下浮动。",
+    )
+    max_dimension: int = Field(
+        default=2048,
+        description="压缩时的最长边上限（像素）；超大图会先缩到该尺寸再做体积估算编码。",
+    )
+    max_quality: int = Field(
+        default=80,
+        description="webp / jpeg 压缩的最高质量（体积估算起点）。",
+    )
+    min_quality: int = Field(
+        default=10,
+        description="webp / jpeg 压缩的最低质量；到达下限仍超标时改为缩小图片尺寸。",
+    )
+    animated_policy: str = Field(
+        default="keep_animated",
+        description=(
+            "动图处理策略，语义与 [image] 相同；"
+            "VLM 路径始终 force_compress，skip 策略也不会原样放行。"
+        ),
+    )
+    max_animation_frames: int = Field(
+        default=512,
+        description="保留动画时的帧数上限，超过则退化为首帧静态图；0 表示不限制。",
+    )
+
+
 class AltTextSectionConfig(PluginConfigBase):
     """VLM 图片描述（alt 文本替换）相关配置。"""
 
@@ -803,6 +987,7 @@ class AltTextSectionConfig(PluginConfigBase):
         default=1024,
         description="持久化描述缓存的条目上限（LRU，按图片内容哈希命中），0 表示不缓存。",
     )
+    image: AltTextImageSectionConfig = Field(default_factory=AltTextImageSectionConfig)
 
 
 class FetchUrlConfig(PluginConfigBase):
@@ -837,7 +1022,7 @@ class FetchUrlPlugin(MaiBotPlugin):
         self._timeout = 15.0
         self._proxy = ""
         self._user_agent = DEFAULT_USER_AGENT
-        self._max_download_size = 16 * 1024 * 1024
+        self._max_download_size = 64 * 1024 * 1024
         self._allow_private_networks = False
         self._global_cookies = ""
         self._domain_cookies: dict[str, str] = {}
@@ -848,12 +1033,10 @@ class FetchUrlPlugin(MaiBotPlugin):
         self._jina_generated_alt = True
         self._acceptable_formats: set[str] = {"jpeg", "png", "gif", "webp"}
         self._convert_format = "webp"
-        self._max_image_size = 2 * 1024 * 1024
-        self._max_dimension = 2048
+        self._max_image_size = 16 * 1024 * 1024
+        self._max_dimension = 4096
         self._quality_start = 80
         self._quality_floor = 10
-        self._animated_policy = "keep_animated"
-        self._max_animation_frames = 512
         self._max_content_length = 8192
         self._llm_summarize = True
         self._llm_model = "planner"
@@ -865,6 +1048,13 @@ class FetchUrlPlugin(MaiBotPlugin):
         self._alt_model = "vlm"
         self._alt_prompt = DEFAULT_ALT_TEXT_PROMPT
         self._alt_cache_size = 1024
+        self._alt_image_convert_format = "webp"
+        self._alt_image_target_size = 1024 * 1024
+        self._alt_image_max_dimension = 2048
+        self._alt_image_max_quality = 80
+        self._alt_image_min_quality = 10
+        self._alt_image_animated_policy = "keep_animated"
+        self._alt_image_max_animation_frames = 512
         self._always_visible_for_planner = False
         self._config_initialized = False
 
@@ -895,13 +1085,28 @@ class FetchUrlPlugin(MaiBotPlugin):
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         """配置热更新：刷新派生缓存。"""
-        del config_data
         if scope == "self":
             self._refresh_config()
             self._vlm_available = None
             if self._alt_cache is not None:
                 self._alt_cache.set_max_entries(self._alt_cache_size)
             self.ctx.logger.info("fetch_url 插件配置已更新: version=%s", version)
+
+    def normalize_plugin_config(
+        self, config_data: Mapping[str, Any] | None
+    ) -> tuple[dict[str, Any], bool]:
+        """补齐默认字段，并在 ``config_version`` 升级时迁移仍为旧默认值的配置项。"""
+        default_config = type(self).build_default_config()
+        merged, changed, notes = normalize_fetch_url_config(config_data, default_config)
+        validated = validate_plugin_config(FetchUrlConfig, merged)
+        normalized = validated.model_dump(mode="python")
+        if notes and hasattr(self, "ctx"):
+            try:
+                self.ctx.logger.info("fetch_url 配置迁移 (%d 项): %s", len(notes), "; ".join(notes))
+            except RuntimeError:
+                pass
+        raw = dict(config_data) if isinstance(config_data, Mapping) else {}
+        return normalized, changed or normalized != raw
 
     def get_components(self) -> list[dict[str, Any]]:
         """收集组件声明，并按配置决定 fetch_url 是否对 Planner 常显。
@@ -965,12 +1170,6 @@ class FetchUrlPlugin(MaiBotPlugin):
         self._max_dimension = max(64, int(image.max_dimension))
         self._quality_start = min(100, max(1, int(image.quality_start)))
         self._quality_floor = min(self._quality_start, max(1, int(image.quality_floor)))
-        animated_policy = (image.animated_policy or "keep_animated").strip().lower()
-        if animated_policy not in _VALID_ANIMATED_POLICIES:
-            self.ctx.logger.warning("无效的动图策略 %r，回退为 keep_animated", animated_policy)
-            animated_policy = "keep_animated"
-        self._animated_policy = animated_policy
-        self._max_animation_frames = max(0, int(image.max_animation_frames))
 
         content = self.config.content
         self._max_content_length = max(256, int(content.max_content_length))
@@ -988,6 +1187,22 @@ class FetchUrlPlugin(MaiBotPlugin):
         self._alt_model = (alt_text.model or "vlm").strip() or "vlm"
         self._alt_prompt = alt_text.prompt or DEFAULT_ALT_TEXT_PROMPT
         self._alt_cache_size = max(0, int(alt_text.cache_size))
+
+        alt_image = alt_text.image
+        alt_convert = _normalize_image_format(alt_image.convert_format)
+        self._alt_image_convert_format = (
+            alt_convert if alt_convert in {"webp", "jpeg", "png", "gif"} else "webp"
+        )
+        self._alt_image_target_size = max(8 * 1024, int(alt_image.target_image_size))
+        self._alt_image_max_dimension = max(64, int(alt_image.max_dimension))
+        self._alt_image_max_quality = min(100, max(1, int(alt_image.max_quality)))
+        self._alt_image_min_quality = min(self._alt_image_max_quality, max(1, int(alt_image.min_quality)))
+        alt_animated_policy = (alt_image.animated_policy or "keep_animated").strip().lower()
+        if alt_animated_policy not in _VALID_ANIMATED_POLICIES:
+            self.ctx.logger.warning("无效的 VLM 动图策略 %r，回退为 keep_animated", alt_animated_policy)
+            alt_animated_policy = "keep_animated"
+        self._alt_image_animated_policy = alt_animated_policy
+        self._alt_image_max_animation_frames = max(0, int(alt_image.max_animation_frames))
 
         self._warn_if_summarize_max_tokens_too_low(self._resolve_summarize_max_tokens())
 
@@ -1331,7 +1546,16 @@ class FetchUrlPlugin(MaiBotPlugin):
                     descriptions[src] = cached
                     continue
                 payload = await asyncio.to_thread(
-                    _prepare_vlm_image_blocking, data, self._alt_min_dimension
+                    _prepare_vlm_image_blocking,
+                    data,
+                    self._alt_min_dimension,
+                    convert_format=self._alt_image_convert_format,
+                    target_image_size=self._alt_image_target_size,
+                    max_dimension=self._alt_image_max_dimension,
+                    max_quality=self._alt_image_max_quality,
+                    min_quality=self._alt_image_min_quality,
+                    animated_policy=self._alt_image_animated_policy,
+                    max_animation_frames=self._alt_image_max_animation_frames,
                 )
                 if payload is None:
                     continue
@@ -1570,7 +1794,7 @@ class FetchUrlPlugin(MaiBotPlugin):
         """图片路径：转码 / 压缩后通过 content_items 回传。"""
         try:
             info = await asyncio.to_thread(
-                _normalize_image_blocking,
+                _normalize_inbound_image_blocking,
                 probe["data"],
                 acceptable_formats=self._acceptable_formats,
                 convert_format=self._convert_format,
@@ -1578,8 +1802,6 @@ class FetchUrlPlugin(MaiBotPlugin):
                 max_dimension=self._max_dimension,
                 quality_start=self._quality_start,
                 quality_floor=self._quality_floor,
-                animated_policy=self._animated_policy,
-                max_animation_frames=self._max_animation_frames,
             )
         except FetchUrlError:
             raise
