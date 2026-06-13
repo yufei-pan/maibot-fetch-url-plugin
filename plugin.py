@@ -20,6 +20,7 @@ from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
@@ -755,7 +756,26 @@ class AltTextCache:
 # --------------------------------------------------------------------------- #
 
 # 与 PluginSectionConfig.config_version 默认值保持同步
-CURRENT_CONFIG_VERSION = "1.5.0"
+CURRENT_CONFIG_VERSION = "1.6.0"
+
+DEFAULT_FETCH_TIMEOUT = 15.0
+DEFAULT_FETCH_MAX_DOWNLOAD_SIZE = 64 * 1024 * 1024
+DEFAULT_JINA_TIMEOUT = 30.0
+DEFAULT_JINA_ENGINE = "browser"
+DEFAULT_IMAGE_ACCEPTABLE_FORMATS = ("jpeg", "png", "gif", "webp")
+DEFAULT_IMAGE_CONVERT_FORMAT = "webp"
+DEFAULT_IMAGE_MAX_IMAGE_SIZE = 16 * 1024 * 1024
+DEFAULT_IMAGE_MAX_DIMENSION = 4096
+DEFAULT_IMAGE_QUALITY_START = 80
+DEFAULT_IMAGE_QUALITY_FLOOR = 10
+DEFAULT_CONTENT_MAX_LENGTH = 8192
+DEFAULT_LLM_MODEL = "planner"
+DEFAULT_LLM_TEMPERATURE = 0.3
+DEFAULT_LLM_MAX_TOKENS = 0
+DEFAULT_ALT_MAX_IMAGES = 3
+DEFAULT_ALT_MIN_DIMENSION = 128
+DEFAULT_ALT_MODEL = "vlm"
+DEFAULT_ALT_CACHE_SIZE = 1024
 
 _LEGACY_DEFAULTS: dict[str, dict[str, Any]] = {
     "fetch.max_download_size": {"<1.5.0": 16 * 1024 * 1024},
@@ -767,9 +787,32 @@ _LEGACY_DEFAULTS: dict[str, dict[str, Any]] = {
 }
 
 _CURRENT_DEFAULTS: dict[str, Any] = {
-    "fetch.max_download_size": 64 * 1024 * 1024,
-    "image.max_image_size": 16 * 1024 * 1024,
-    "image.max_dimension": 4096,
+    "plugin.always_visible_for_planner": False,
+    "fetch.timeout": DEFAULT_FETCH_TIMEOUT,
+    "fetch.user_agent": DEFAULT_USER_AGENT,
+    "fetch.max_download_size": DEFAULT_FETCH_MAX_DOWNLOAD_SIZE,
+    "fetch.allow_private_networks": False,
+    "jina.enabled": True,
+    "jina.timeout": DEFAULT_JINA_TIMEOUT,
+    "jina.engine": DEFAULT_JINA_ENGINE,
+    "jina.with_generated_alt": True,
+    "image.acceptable_formats": list(DEFAULT_IMAGE_ACCEPTABLE_FORMATS),
+    "image.convert_format": DEFAULT_IMAGE_CONVERT_FORMAT,
+    "image.max_image_size": DEFAULT_IMAGE_MAX_IMAGE_SIZE,
+    "image.max_dimension": DEFAULT_IMAGE_MAX_DIMENSION,
+    "image.quality_start": DEFAULT_IMAGE_QUALITY_START,
+    "image.quality_floor": DEFAULT_IMAGE_QUALITY_FLOOR,
+    "content.max_content_length": DEFAULT_CONTENT_MAX_LENGTH,
+    "content.llm_summarize": True,
+    "llm.model": DEFAULT_LLM_MODEL,
+    "llm.temperature": DEFAULT_LLM_TEMPERATURE,
+    "llm.max_tokens": DEFAULT_LLM_MAX_TOKENS,
+    "llm.summarize_prompt_template": DEFAULT_SUMMARIZE_PROMPT_TEMPLATE,
+    "alt_text.max_images": DEFAULT_ALT_MAX_IMAGES,
+    "alt_text.min_dimension": DEFAULT_ALT_MIN_DIMENSION,
+    "alt_text.model": DEFAULT_ALT_MODEL,
+    "alt_text.prompt": DEFAULT_ALT_TEXT_PROMPT,
+    "alt_text.cache_size": DEFAULT_ALT_CACHE_SIZE,
     "alt_text.image.target_image_size": 1024 * 1024,
     "alt_text.image.max_dimension": 2048,
     "alt_text.image.max_quality": 80,
@@ -778,6 +821,52 @@ _CURRENT_DEFAULTS: dict[str, Any] = {
     "alt_text.image.max_animation_frames": 512,
     "alt_text.image.convert_format": "webp",
 }
+
+# 1.6.0 迁移时保留语义性空值，不还原为占位
+_STRIP_SKIP_PATHS = frozenset({
+    "fetch.proxy",
+    "fetch.cookies",
+    "jina.api_key",
+})
+
+# 与旧版 config.toml 写死的默认模板比对后还原为 ""
+_STRIP_TO_EMPTY_STRING_PATHS = frozenset({
+    "llm.summarize_prompt_template",
+    "alt_text.prompt",
+})
+
+
+def _placeholder_for_baked_default(dotted: str, baked: Any) -> Any:
+    if dotted in _STRIP_TO_EMPTY_STRING_PATHS:
+        return ""
+    return None
+
+
+def _strip_baked_defaults_to_placeholders(config: dict[str, Any]) -> tuple[dict[str, Any], bool, list[str]]:
+    """将仍等于 1.5.0 写死默认值的字段还原为占位空值，便于升级后跟随代码内置默认。"""
+    notes: list[str] = []
+    changed = False
+    for dotted, baked in _CURRENT_DEFAULTS.items():
+        if dotted in _STRIP_SKIP_PATHS:
+            continue
+        current = _get_nested_config(config, dotted)
+        if current is _CONFIG_MISSING or current != baked:
+            continue
+        placeholder = _placeholder_for_baked_default(dotted, baked)
+        _set_nested_config(config, dotted, placeholder)
+        notes.append(f"{dotted}: 已还原为占位默认")
+        changed = True
+    return config, changed, notes
+
+
+def _migrate_legacy_baked_defaults(config: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """config_version 已为最新但字段仍写死旧默认时，再次还原为占位。"""
+    migrated, changed, _ = _strip_baked_defaults_to_placeholders(config)
+    if changed:
+        plugin_section = migrated.get("plugin")
+        if isinstance(plugin_section, dict):
+            plugin_section["config_version"] = CURRENT_CONFIG_VERSION
+    return migrated, changed
 
 
 class _ConfigMissing:
@@ -922,6 +1011,10 @@ def _migrate_plugin_config_data(config: dict[str, Any], from_version: str) -> tu
                 nested["max_dimension"] = _CURRENT_DEFAULTS["alt_text.image.max_dimension"]
                 notes.append("alt_text.image.max_dimension: 1024 -> 2048（仍为旧默认）")
 
+    if _config_version_less_than(from_version, "1.6.0"):
+        _, strip_changed, strip_notes = _strip_baked_defaults_to_placeholders(config)
+        notes.extend(strip_notes)
+
     plugin_section = config.get("plugin")
     if isinstance(plugin_section, dict):
         plugin_section["config_version"] = CURRENT_CONFIG_VERSION
@@ -964,8 +1057,9 @@ class PluginSectionConfig(PluginConfigBase):
 
     enabled: bool = Field(default=True, description="是否启用插件")
     config_version: str = Field(default=CURRENT_CONFIG_VERSION, description="配置版本")
-    always_visible_for_planner: bool = Field(
-        default=False,
+    always_visible_for_planner: bool | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": "false"},
         description=(
             "是否让 fetch_url 工具始终对 Planner 可见（等同 core_tool）。"
             "开启后无需 tool_search 即可直接调用；修改后需重新加载插件才能生效。"
@@ -980,18 +1074,28 @@ class FetchSectionConfig(PluginConfigBase):
     __ui_icon__ = "globe"
     __ui_order__ = 1
 
-    timeout: float = Field(default=15.0, description="直接抓取 URL 的 HTTP 超时时间（秒）。")
+    timeout: float | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": "15.0"},
+        description="直接抓取 URL 的 HTTP 超时时间（秒）。",
+    )
     proxy: str = Field(
         default="",
         description="抓取内容时使用的代理地址（例如 http://127.0.0.1:7890）；留空表示不使用代理。",
     )
-    user_agent: str = Field(default=DEFAULT_USER_AGENT, description="抓取时使用的 User-Agent。")
-    max_download_size: int = Field(
-        default=64 * 1024 * 1024,
+    user_agent: str | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": DEFAULT_USER_AGENT},
+        description="抓取时使用的 User-Agent。",
+    )
+    max_download_size: int | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": str(DEFAULT_FETCH_MAX_DOWNLOAD_SIZE)},
         description="单次下载的最大字节数（默认 64 MB），超过即中止并报错。",
     )
-    allow_private_networks: bool = Field(
-        default=False,
+    allow_private_networks: bool | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": "false"},
         description="是否允许抓取内网 / 环回 / 保留地址。默认关闭（SSRF 防护），仅在确有需要时开启。",
     )
     cookies: str = Field(
@@ -1014,24 +1118,28 @@ class JinaSectionConfig(PluginConfigBase):
     __ui_icon__ = "book-open"
     __ui_order__ = 2
 
-    enabled: bool = Field(
-        default=True,
+    enabled: bool | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": "true"},
         description="是否优先使用 jina.ai Reader 抓取非图片内容（支持网页 / PDF，质量更好）。",
     )
     api_key: str = Field(
         default="",
         description="jina.ai API Key（可选）。不填也能用但有更严格的频率限制。请勿提交到版本库。",
     )
-    timeout: float = Field(
-        default=30.0,
+    timeout: float | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": "30.0"},
         description="jina.ai 请求超时时间（秒）。超时视为提供方故障，自动回退到本地 markdownify 抓取。",
     )
-    engine: str = Field(
-        default="browser",
+    engine: str | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": DEFAULT_JINA_ENGINE},
         description="jina.ai 渲染引擎（X-Engine 头），browser 渲染质量最好；留空表示由 jina 自动选择。",
     )
-    with_generated_alt: bool = Field(
-        default=True,
+    with_generated_alt: bool | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": "true"},
         description=(
             "是否在配置了 jina API Key 时让 jina 为缺失 alt 的图片生成描述"
             "（X-With-Generated-Alt 头）。未配置 API Key 时不会发送该头。"
@@ -1046,31 +1154,37 @@ class ImageSectionConfig(PluginConfigBase):
     __ui_icon__ = "image"
     __ui_order__ = 3
 
-    acceptable_formats: list[str] = Field(
-        default_factory=lambda: ["jpeg", "png", "gif", "webp"],
+    acceptable_formats: list[str] | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": json.dumps(list(DEFAULT_IMAGE_ACCEPTABLE_FORMATS))},
         description="可直接原样回传的图片格式；不在列表内或超过 max_image_size 时触发预处理编码。",
     )
-    convert_format: str = Field(
-        default="webp",
+    convert_format: str | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": DEFAULT_IMAGE_CONVERT_FORMAT},
         description="预处理编码的目标格式，可选 webp / jpeg / png / gif。",
     )
-    max_image_size: int = Field(
-        default=16 * 1024 * 1024,
+    max_image_size: int | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": str(DEFAULT_IMAGE_MAX_IMAGE_SIZE)},
         description=(
             "原样回传的体积上限（默认 16 MB）。超过则无论格式一律按 convert_format 预处理编码，"
             "并以该值为体积压缩目标；不支持格式转码时同理。"
         ),
     )
-    max_dimension: int = Field(
-        default=4096,
+    max_dimension: int | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": str(DEFAULT_IMAGE_MAX_DIMENSION)},
         description="原样回传的最长边上限（像素，默认 4096）；超过则触发预处理编码，编码时也会预缩到该尺寸。",
     )
-    quality_start: int = Field(
-        default=80,
+    quality_start: int | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": str(DEFAULT_IMAGE_QUALITY_START)},
         description="预处理编码时 webp / jpeg 的初始质量。",
     )
-    quality_floor: int = Field(
-        default=10,
+    quality_floor: int | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": str(DEFAULT_IMAGE_QUALITY_FLOOR)},
         description="预处理编码时 webp / jpeg 的最低质量；到达下限仍超标时改为缩小图片尺寸。",
     )
 
@@ -1082,12 +1196,14 @@ class ContentSectionConfig(PluginConfigBase):
     __ui_icon__ = "file-text"
     __ui_order__ = 4
 
-    max_content_length: int = Field(
-        default=8192,
+    max_content_length: int | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": str(DEFAULT_CONTENT_MAX_LENGTH)},
         description="单次返回文本内容的最大字符数；超过时按 llm_summarize 设置进行总结或截断。",
     )
-    llm_summarize: bool = Field(
-        default=True,
+    llm_summarize: bool | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": "true"},
         description="超长内容是否默认调用 LLM 总结；关闭后超长内容一律截断。",
     )
 
@@ -1099,20 +1215,26 @@ class LLMSectionConfig(PluginConfigBase):
     __ui_icon__ = "sparkles"
     __ui_order__ = 5
 
-    model: str = Field(
-        default="planner",
+    model: str | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": DEFAULT_LLM_MODEL},
         description="总结时使用的 LLM 模型任务名（planner / replyer 等 Host 任务名，不是原始模型 ID）。",
     )
-    temperature: float = Field(default=0.3, description="总结时的采样温度。")
-    max_tokens: int = Field(
-        default=0,
+    temperature: float | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": str(DEFAULT_LLM_TEMPERATURE)},
+        description="总结时的采样温度。",
+    )
+    max_tokens: int | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": str(DEFAULT_LLM_MAX_TOKENS)},
         description=(
             "总结 LLM 调用的最大 token 数；0 表示自动按 max_content_length 的四倍计算。"
             "若小于 max_content_length 会在日志中告警，输出可能被截断。"
         ),
     )
     summarize_prompt_template: str = Field(
-        default=DEFAULT_SUMMARIZE_PROMPT_TEMPLATE,
+        default="",
         description=(
             "总结提示词模板。占位符：{nickname}、{personality}、{reply_style}、{url}、"
             "{total}、{max_length}、{focus_section}、{content}。"
@@ -1127,35 +1249,42 @@ class AltTextImageSectionConfig(PluginConfigBase):
     __ui_icon__ = "image"
     __ui_order__ = 0
 
-    convert_format: str = Field(
-        default="webp",
+    convert_format: str | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": DEFAULT_IMAGE_CONVERT_FORMAT},
         description="送入 VLM 前的转换目标格式，可选 webp / jpeg / png / gif。",
     )
-    target_image_size: int = Field(
-        default=1024 * 1024,
+    target_image_size: int | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": str(1024 * 1024)},
         description="体积估算算法的目标字节数（默认 1 MB）；输出允许在目标附近上下浮动。",
     )
-    max_dimension: int = Field(
-        default=2048,
+    max_dimension: int | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": "2048"},
         description="压缩时的最长边上限（像素）；超大图会先缩到该尺寸再做体积估算编码。",
     )
-    max_quality: int = Field(
-        default=80,
+    max_quality: int | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": "80"},
         description="webp / jpeg 压缩的最高质量（体积估算起点）。",
     )
-    min_quality: int = Field(
-        default=10,
+    min_quality: int | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": "10"},
         description="webp / jpeg 压缩的最低质量；到达下限仍超标时改为缩小图片尺寸。",
     )
-    animated_policy: str = Field(
-        default="keep_animated",
+    animated_policy: str | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": "keep_animated"},
         description=(
             "动图处理策略，语义与 [image] 相同；"
             "VLM 路径始终 force_compress，skip 策略也不会原样放行。"
         ),
     )
-    max_animation_frames: int = Field(
-        default=512,
+    max_animation_frames: int | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": "512"},
         description="保留动画时的帧数上限，超过则退化为首帧静态图；0 表示不限制。",
     )
 
@@ -1167,27 +1296,31 @@ class AltTextSectionConfig(PluginConfigBase):
     __ui_icon__ = "eye"
     __ui_order__ = 6
 
-    max_images: int = Field(
-        default=3,
+    max_images: int | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": str(DEFAULT_ALT_MAX_IMAGES)},
         description=(
             "每次抓取最多用 VLM 描述的图片数量；页面图片超过该值时优先描述最大的几张"
             "（按 HEAD Content-Length 排序）。0 表示关闭 VLM 描述（保留 jina / 原始 alt）。"
         ),
     )
-    min_dimension: int = Field(
-        default=128,
+    min_dimension: int | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": str(DEFAULT_ALT_MIN_DIMENSION)},
         description="参与 VLM 描述的图片最短边下限（像素），用于跳过图标 / Logo。",
     )
-    model: str = Field(
-        default="vlm",
+    model: str | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": DEFAULT_ALT_MODEL},
         description="生成图片描述使用的模型任务名（默认 Host 的 vlm 任务）。",
     )
     prompt: str = Field(
-        default=DEFAULT_ALT_TEXT_PROMPT,
+        default="",
         description="生成图片描述的提示词。",
     )
-    cache_size: int = Field(
-        default=1024,
+    cache_size: int | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": str(DEFAULT_ALT_CACHE_SIZE)},
         description="持久化描述缓存的条目上限（LRU，按图片内容哈希命中），0 表示不缓存。",
     )
     image: AltTextImageSectionConfig = Field(default_factory=AltTextImageSectionConfig)
@@ -1203,6 +1336,144 @@ class FetchUrlConfig(PluginConfigBase):
     content: ContentSectionConfig = Field(default_factory=ContentSectionConfig)
     llm: LLMSectionConfig = Field(default_factory=LLMSectionConfig)
     alt_text: AltTextSectionConfig = Field(default_factory=AltTextSectionConfig)
+
+
+# --------------------------------------------------------------------------- #
+# 配置解析（空值 = 使用代码内置默认，便于版本升级后自动跟随新默认）
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class EffectiveFetchUrlConfig:
+    """运行时生效的插件配置（已解析占位空值）。"""
+
+    always_visible_for_planner: bool
+    timeout: float
+    user_agent: str
+    max_download_size: int
+    allow_private_networks: bool
+    jina_enabled: bool
+    jina_timeout: float
+    jina_engine: str
+    jina_generated_alt: bool
+    acceptable_formats: frozenset[str]
+    convert_format: str
+    max_image_size: int
+    max_dimension: int
+    quality_start: int
+    quality_floor: int
+    max_content_length: int
+    llm_summarize: bool
+    llm_model: str
+    llm_temperature: float
+    llm_max_tokens: int
+    summarize_template: str
+    alt_max_images: int
+    alt_min_dimension: int
+    alt_model: str
+    alt_prompt: str
+    alt_cache_size: int
+    alt_image_convert_format: str
+    alt_image_target_size: int
+    alt_image_max_dimension: int
+    alt_image_max_quality: int
+    alt_image_min_quality: int
+    alt_image_animated_policy: str
+    alt_image_max_animation_frames: int
+
+
+def _effective_bool(value: bool | None, default: bool) -> bool:
+    if value is None:
+        return default
+    return bool(value)
+
+
+def _effective_str(value: str | None, default: str) -> str:
+    if value is None or not str(value).strip():
+        return default
+    return str(value).strip()
+
+
+def _effective_float(value: float | None, default: float, *, minimum: float = 0.0) -> float:
+    if value is None:
+        return default
+    return max(minimum, float(value))
+
+
+def _effective_int(value: int | None, default: int, *, minimum: int = 0) -> int:
+    if value is None:
+        return default
+    return max(minimum, int(value))
+
+
+def _effective_jina_engine(value: str | None) -> str:
+    if value is None:
+        return DEFAULT_JINA_ENGINE
+    return str(value).strip()
+
+
+def resolve_effective_fetch_url_config(cfg: FetchUrlConfig) -> EffectiveFetchUrlConfig:
+    image = cfg.image
+    formats = {_normalize_image_format(fmt) for fmt in (image.acceptable_formats or DEFAULT_IMAGE_ACCEPTABLE_FORMATS)}
+    acceptable = frozenset(fmt for fmt in formats if fmt) or frozenset(DEFAULT_IMAGE_ACCEPTABLE_FORMATS)
+    convert_format = _normalize_image_format(image.convert_format or DEFAULT_IMAGE_CONVERT_FORMAT)
+    if convert_format not in {"webp", "jpeg", "png", "gif"}:
+        convert_format = DEFAULT_IMAGE_CONVERT_FORMAT
+
+    alt_image = cfg.alt_text.image
+    alt_convert = _normalize_image_format(alt_image.convert_format or DEFAULT_IMAGE_CONVERT_FORMAT)
+    if alt_convert not in {"webp", "jpeg", "png", "gif"}:
+        alt_convert = DEFAULT_IMAGE_CONVERT_FORMAT
+    alt_animated_policy = (alt_image.animated_policy or "keep_animated").strip().lower()
+    if alt_animated_policy not in _VALID_ANIMATED_POLICIES:
+        alt_animated_policy = "keep_animated"
+
+    quality_start = min(100, max(1, _effective_int(image.quality_start, DEFAULT_IMAGE_QUALITY_START, minimum=1)))
+    quality_floor = min(quality_start, max(1, _effective_int(image.quality_floor, DEFAULT_IMAGE_QUALITY_FLOOR, minimum=1)))
+    alt_max_quality = min(100, max(1, _effective_int(alt_image.max_quality, 80, minimum=1)))
+    alt_min_quality = min(
+        alt_max_quality, max(1, _effective_int(alt_image.min_quality, 10, minimum=1))
+    )
+
+    user_agent = (cfg.fetch.user_agent or DEFAULT_USER_AGENT).strip() or DEFAULT_USER_AGENT
+
+    return EffectiveFetchUrlConfig(
+        always_visible_for_planner=_effective_bool(cfg.plugin.always_visible_for_planner, False),
+        timeout=_effective_float(cfg.fetch.timeout, DEFAULT_FETCH_TIMEOUT, minimum=1.0),
+        user_agent=user_agent,
+        max_download_size=_effective_int(cfg.fetch.max_download_size, DEFAULT_FETCH_MAX_DOWNLOAD_SIZE, minimum=1024),
+        allow_private_networks=_effective_bool(cfg.fetch.allow_private_networks, False),
+        jina_enabled=_effective_bool(cfg.jina.enabled, True),
+        jina_timeout=_effective_float(cfg.jina.timeout, DEFAULT_JINA_TIMEOUT, minimum=1.0),
+        jina_engine=_effective_jina_engine(cfg.jina.engine),
+        jina_generated_alt=_effective_bool(cfg.jina.with_generated_alt, True),
+        acceptable_formats=acceptable,
+        convert_format=convert_format,
+        max_image_size=_effective_int(cfg.image.max_image_size, DEFAULT_IMAGE_MAX_IMAGE_SIZE, minimum=8 * 1024),
+        max_dimension=_effective_int(cfg.image.max_dimension, DEFAULT_IMAGE_MAX_DIMENSION, minimum=64),
+        quality_start=quality_start,
+        quality_floor=quality_floor,
+        max_content_length=_effective_int(cfg.content.max_content_length, DEFAULT_CONTENT_MAX_LENGTH, minimum=256),
+        llm_summarize=_effective_bool(cfg.content.llm_summarize, True),
+        llm_model=_effective_str(cfg.llm.model, DEFAULT_LLM_MODEL),
+        llm_temperature=float(cfg.llm.temperature if cfg.llm.temperature is not None else DEFAULT_LLM_TEMPERATURE),
+        llm_max_tokens=max(0, _effective_int(cfg.llm.max_tokens, DEFAULT_LLM_MAX_TOKENS)),
+        summarize_template=cfg.llm.summarize_prompt_template or DEFAULT_SUMMARIZE_PROMPT_TEMPLATE,
+        alt_max_images=max(0, _effective_int(cfg.alt_text.max_images, DEFAULT_ALT_MAX_IMAGES)),
+        alt_min_dimension=max(1, _effective_int(cfg.alt_text.min_dimension, DEFAULT_ALT_MIN_DIMENSION, minimum=1)),
+        alt_model=_effective_str(cfg.alt_text.model, DEFAULT_ALT_MODEL),
+        alt_prompt=cfg.alt_text.prompt or DEFAULT_ALT_TEXT_PROMPT,
+        alt_cache_size=max(0, _effective_int(cfg.alt_text.cache_size, DEFAULT_ALT_CACHE_SIZE)),
+        alt_image_convert_format=alt_convert,
+        alt_image_target_size=max(8 * 1024, _effective_int(alt_image.target_image_size, 1024 * 1024, minimum=8 * 1024)),
+        alt_image_max_dimension=max(64, _effective_int(alt_image.max_dimension, 2048, minimum=64)),
+        alt_image_max_quality=alt_max_quality,
+        alt_image_min_quality=alt_min_quality,
+        alt_image_animated_policy=alt_animated_policy,
+        alt_image_max_animation_frames=max(
+            0, _effective_int(alt_image.max_animation_frames, 512)
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1309,7 +1580,8 @@ class FetchUrlPlugin(MaiBotPlugin):
             except RuntimeError:
                 pass
         raw = dict(config_data) if isinstance(config_data, Mapping) else {}
-        return normalized, changed or normalized != raw
+        migrated, migrated_changed = _migrate_legacy_baked_defaults(normalized)
+        return migrated, changed or normalized != raw or migrated_changed
 
     def get_components(self) -> list[dict[str, Any]]:
         """收集组件声明，并按配置决定 fetch_url 是否对 Planner 常显。
@@ -1319,7 +1591,7 @@ class FetchUrlPlugin(MaiBotPlugin):
         """
         components = super().get_components()
         try:
-            always_visible = bool(self.config.plugin.always_visible_for_planner)
+            always_visible = resolve_effective_fetch_url_config(self.config).always_visible_for_planner
         except RuntimeError:
             always_visible = self._always_visible_for_planner
         if not always_visible:
@@ -1335,8 +1607,8 @@ class FetchUrlPlugin(MaiBotPlugin):
 
     def _refresh_config(self) -> None:
         """从强类型配置刷新派生缓存。"""
-        plugin = self.config.plugin
-        next_always_visible = bool(plugin.always_visible_for_planner)
+        effective = resolve_effective_fetch_url_config(self.config)
+        next_always_visible = effective.always_visible_for_planner
         if self._config_initialized and next_always_visible != self._always_visible_for_planner:
             self.ctx.logger.warning(
                 "always_visible_for_planner 已变更，请禁用后重新启用插件以使 Planner 工具可见性生效"
@@ -1345,11 +1617,11 @@ class FetchUrlPlugin(MaiBotPlugin):
         self._config_initialized = True
 
         fetch = self.config.fetch
-        self._timeout = max(1.0, float(fetch.timeout))
+        self._timeout = effective.timeout
         self._proxy = (fetch.proxy or "").strip()
-        self._user_agent = (fetch.user_agent or DEFAULT_USER_AGENT).strip() or DEFAULT_USER_AGENT
-        self._max_download_size = max(1024, int(fetch.max_download_size))
-        self._allow_private_networks = bool(fetch.allow_private_networks)
+        self._user_agent = effective.user_agent
+        self._max_download_size = effective.max_download_size
+        self._allow_private_networks = effective.allow_private_networks
         self._global_cookies = (fetch.cookies or "").strip()
         self._domain_cookies = {
             str(domain).strip().lstrip(".").lower(): str(cookie).strip()
@@ -1357,55 +1629,44 @@ class FetchUrlPlugin(MaiBotPlugin):
             if str(domain).strip() and str(cookie).strip()
         }
 
-        jina = self.config.jina
-        self._jina_enabled = bool(jina.enabled)
-        self._jina_api_key = (jina.api_key or "").strip()
-        self._jina_timeout = max(1.0, float(jina.timeout))
-        self._jina_engine = (jina.engine or "").strip()
-        self._jina_generated_alt = bool(jina.with_generated_alt)
+        self._jina_enabled = effective.jina_enabled
+        self._jina_api_key = (self.config.jina.api_key or "").strip()
+        self._jina_timeout = effective.jina_timeout
+        self._jina_engine = effective.jina_engine
+        self._jina_generated_alt = effective.jina_generated_alt
 
-        image = self.config.image
-        formats = {_normalize_image_format(fmt) for fmt in (image.acceptable_formats or [])}
-        self._acceptable_formats = {fmt for fmt in formats if fmt} or {"jpeg", "png", "gif", "webp"}
-        convert_format = _normalize_image_format(image.convert_format)
-        self._convert_format = convert_format if convert_format in {"webp", "jpeg", "png", "gif"} else "webp"
-        self._max_image_size = max(8 * 1024, int(image.max_image_size))
-        self._max_dimension = max(64, int(image.max_dimension))
-        self._quality_start = min(100, max(1, int(image.quality_start)))
-        self._quality_floor = min(self._quality_start, max(1, int(image.quality_floor)))
+        self._acceptable_formats = set(effective.acceptable_formats)
+        self._convert_format = effective.convert_format
+        self._max_image_size = effective.max_image_size
+        self._max_dimension = effective.max_dimension
+        self._quality_start = effective.quality_start
+        self._quality_floor = effective.quality_floor
 
-        content = self.config.content
-        self._max_content_length = max(256, int(content.max_content_length))
-        self._llm_summarize = bool(content.llm_summarize)
+        self._max_content_length = effective.max_content_length
+        self._llm_summarize = effective.llm_summarize
 
-        llm = self.config.llm
-        self._llm_model = (llm.model or "planner").strip() or "planner"
-        self._llm_temperature = float(llm.temperature)
-        self._llm_max_tokens = max(0, int(llm.max_tokens))
-        self._summarize_template = llm.summarize_prompt_template or DEFAULT_SUMMARIZE_PROMPT_TEMPLATE
+        self._llm_model = effective.llm_model
+        self._llm_temperature = effective.llm_temperature
+        self._llm_max_tokens = effective.llm_max_tokens
+        self._summarize_template = effective.summarize_template
 
-        alt_text = self.config.alt_text
-        self._alt_max_images = max(0, int(alt_text.max_images))
-        self._alt_min_dimension = max(1, int(alt_text.min_dimension))
-        self._alt_model = (alt_text.model or "vlm").strip() or "vlm"
-        self._alt_prompt = alt_text.prompt or DEFAULT_ALT_TEXT_PROMPT
-        self._alt_cache_size = max(0, int(alt_text.cache_size))
+        self._alt_max_images = effective.alt_max_images
+        self._alt_min_dimension = effective.alt_min_dimension
+        self._alt_model = effective.alt_model
+        self._alt_prompt = effective.alt_prompt
+        self._alt_cache_size = effective.alt_cache_size
 
-        alt_image = alt_text.image
-        alt_convert = _normalize_image_format(alt_image.convert_format)
-        self._alt_image_convert_format = (
-            alt_convert if alt_convert in {"webp", "jpeg", "png", "gif"} else "webp"
-        )
-        self._alt_image_target_size = max(8 * 1024, int(alt_image.target_image_size))
-        self._alt_image_max_dimension = max(64, int(alt_image.max_dimension))
-        self._alt_image_max_quality = min(100, max(1, int(alt_image.max_quality)))
-        self._alt_image_min_quality = min(self._alt_image_max_quality, max(1, int(alt_image.min_quality)))
-        alt_animated_policy = (alt_image.animated_policy or "keep_animated").strip().lower()
+        self._alt_image_convert_format = effective.alt_image_convert_format
+        self._alt_image_target_size = effective.alt_image_target_size
+        self._alt_image_max_dimension = effective.alt_image_max_dimension
+        self._alt_image_max_quality = effective.alt_image_max_quality
+        self._alt_image_min_quality = effective.alt_image_min_quality
+        alt_animated_policy = effective.alt_image_animated_policy
         if alt_animated_policy not in _VALID_ANIMATED_POLICIES:
             self.ctx.logger.warning("无效的 VLM 动图策略 %r，回退为 keep_animated", alt_animated_policy)
             alt_animated_policy = "keep_animated"
         self._alt_image_animated_policy = alt_animated_policy
-        self._alt_image_max_animation_frames = max(0, int(alt_image.max_animation_frames))
+        self._alt_image_max_animation_frames = effective.alt_image_max_animation_frames
 
         self._warn_if_summarize_max_tokens_too_low(self._resolve_summarize_max_tokens())
 

@@ -112,11 +112,15 @@ def test_config_migration_from_1_2_0() -> None:
     merged, changed, notes = fetch_plugin._normalize_fetch_url_config(legacy, default_config)
     assert changed
     assert merged["plugin"]["config_version"] == fetch_plugin.CURRENT_CONFIG_VERSION
-    assert merged["fetch"]["max_download_size"] == 64 * 1024 * 1024
-    assert merged["image"]["max_image_size"] == 16 * 1024 * 1024
-    assert merged["image"]["max_dimension"] == 4096
+    assert merged["fetch"]["max_download_size"] is None
+    assert merged["image"]["max_image_size"] is None
+    assert merged["image"]["max_dimension"] is None
     assert "animated_policy" not in merged["image"]
     assert notes
+    eff = fetch_plugin.resolve_effective_fetch_url_config(fetch_plugin.FetchUrlConfig.model_validate(merged))
+    assert eff.max_download_size == 64 * 1024 * 1024
+    assert eff.max_image_size == 16 * 1024 * 1024
+    assert eff.max_dimension == 4096
     print("ok: config migration 1.2.0 -> current defaults")
 
     legacy_custom = {
@@ -148,12 +152,15 @@ def test_config_migration_alt_text_image_renames() -> None:
     merged, changed, notes = fetch_plugin._normalize_fetch_url_config(legacy, default_config)
     assert changed
     alt_image = merged["alt_text"]["image"]
-    assert alt_image["target_image_size"] == 1024 * 1024
-    assert alt_image["max_quality"] == 80
-    assert alt_image["min_quality"] == 10
-    assert alt_image["animated_policy"] == "keep_animated"
+    assert alt_image["target_image_size"] is None
+    assert alt_image["max_quality"] is None
+    assert alt_image["min_quality"] is None
+    assert alt_image["animated_policy"] is None
     assert "max_image_size" not in alt_image
     assert notes
+    eff = fetch_plugin.resolve_effective_fetch_url_config(fetch_plugin.FetchUrlConfig.model_validate(merged))
+    assert eff.alt_image_target_size == 1024 * 1024
+    assert eff.alt_image_animated_policy == "keep_animated"
     print("ok: alt_text.image field renames and default bumps")
 
 
@@ -172,17 +179,34 @@ def test_get_components_planner_visibility() -> None:
     print("ok: get_components planner visibility toggle")
 
 
+def test_resolve_effective_defaults() -> None:
+    """占位空值应解析为代码内置默认。"""
+    cfg = fetch_plugin.FetchUrlConfig()
+    eff = fetch_plugin.resolve_effective_fetch_url_config(cfg)
+    assert eff.timeout == 15.0
+    assert eff.max_download_size == 64 * 1024 * 1024
+    assert eff.jina_engine == "browser"
+    assert eff.convert_format == "webp"
+    assert eff.alt_image_target_size == 1024 * 1024
+
+    auto_cfg = fetch_plugin.FetchUrlConfig(
+        jina=fetch_plugin.JinaSectionConfig(engine=""),
+    )
+    assert fetch_plugin.resolve_effective_fetch_url_config(auto_cfg).jina_engine == ""
+    print("ok: resolve effective defaults")
+
+
 def test_plugin_importable() -> None:
     instance = fetch_plugin.create_plugin()
     assert instance is not None
     default_config = type(instance).build_default_config()
     assert default_config["plugin"]["enabled"] is True
     assert default_config["plugin"]["config_version"] == fetch_plugin.CURRENT_CONFIG_VERSION
-    assert default_config["image"]["convert_format"] == "webp"
-    assert default_config["alt_text"]["cache_size"] == 1024
-    assert default_config["alt_text"]["image"]["convert_format"] == "webp"
-    assert default_config["alt_text"]["image"]["target_image_size"] == 1024 * 1024
-    assert default_config["alt_text"]["image"]["animated_policy"] == "keep_animated"
+    assert default_config["image"]["convert_format"] is None
+    assert default_config["alt_text"]["cache_size"] is None
+    assert default_config["alt_text"]["image"]["convert_format"] is None
+    assert default_config["alt_text"]["image"]["target_image_size"] is None
+    assert default_config["alt_text"]["image"]["animated_policy"] is None
     assert "animated_policy" not in default_config["image"]
 
     config_data = tomllib.loads((PLUGIN_DIR / "config.toml").read_text(encoding="utf-8"))
@@ -428,6 +452,7 @@ def main() -> None:
 
     test_get_components_planner_visibility()
     test_plugin_importable()
+    test_resolve_effective_defaults()
     test_config_migration_from_1_2_0()
     test_config_migration_alt_text_image_renames()
     test_inbound_passthrough_acceptable_format()

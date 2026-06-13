@@ -1,22 +1,27 @@
+# Fetch URL 插件配置
+#
+# 各配置节下的数值、字符串与布尔字段留空（或不写）即使用插件代码中的内置默认；
+# 仅在你需要覆盖默认值时再填写。插件升级后修改内置默认时，留空字段会自动跟随新默认。
+
 [plugin]
 # 是否启用插件
 enabled = true
 # 配置版本（低于插件模型默认值时，Runner 会触发迁移并写回）
-config_version = "1.5.0"
+config_version = "1.6.0"
 # 是否让 fetch_url 始终对 Planner 可见（无需 tool_search 发现）。修改后需重新加载插件才能生效
-always_visible_for_planner = false
+# always_visible_for_planner = false
 
 [fetch]
 # 直接抓取 URL 的 HTTP 超时时间（秒）
-timeout = 15.0
+# timeout = 15.0
 # 抓取内容时使用的代理地址（例如 "http://127.0.0.1:7890"）；留空表示不使用代理
 proxy = ""
 # 抓取时使用的 User-Agent
-user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+# user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 # 单次下载的最大字节数（默认 64 MB），超过即中止并报错
-max_download_size = 67108864
+# max_download_size = 67108864
 # 是否允许抓取内网 / 环回 / 保留地址。默认关闭（SSRF 防护），仅在确有需要时开启
-allow_private_networks = false
+# allow_private_networks = false
 # 对所有域名发送的全局 Cookie 字符串（例如 "key1=value1; key2=value2"）。请勿提交到版本库
 cookies = ""
 
@@ -28,89 +33,89 @@ cookies = ""
 
 [jina]
 # 是否优先使用 jina.ai Reader 抓取非图片内容（支持网页 / PDF，质量更好）
-enabled = true
+# enabled = true
 # jina.ai API Key（可选）。不填也能用但有更严格的频率限制。请勿提交到版本库
 api_key = ""
 # jina.ai 请求超时时间（秒）。超时视为提供方故障，自动回退到本地 markdownify 抓取
-timeout = 30.0
+# timeout = 30.0
 # jina.ai 渲染引擎（X-Engine 头），browser 渲染质量最好；留空表示由 jina 自动选择
-engine = "browser"
+# engine = "browser"
 # 是否在配置了 jina API Key 时让 jina 为缺失 alt 的图片生成描述（X-With-Generated-Alt 头）
 # 未配置 API Key 时不会发送该头（jina 对该功能要求认证）
-with_generated_alt = true
+# with_generated_alt = true
 
 [image]
 # 可直接原样回传的格式；不在列表内或超过 max_image_size 或者 max_dimension 时触发预处理编码
-acceptable_formats = ["jpeg", "png", "gif", "webp"]
+# acceptable_formats = ["jpeg", "png", "gif", "webp"]
 # 预处理编码的目标格式，可选 webp / jpeg / png / gif
-convert_format = "webp"
+# convert_format = "webp"
 # 原样回传体积上限（默认 16 MB）；超过则无论格式一律预处理，并以该值为压缩目标
-max_image_size = 16777216
+# max_image_size = 16777216
 # 原样回传的最长边上限（默认 4096 px）；超过则触发预处理，编码时也预缩到该尺寸
-max_dimension = 4096
+# max_dimension = 4096
 # 预处理编码时 webp / jpeg 的初始质量
-quality_start = 80
+# quality_start = 80
 # 预处理编码时 webp / jpeg 的最低质量；到达下限仍超标时改为缩小图片尺寸
-quality_floor = 10
+# quality_floor = 10
 
 [content]
 # 单次返回文本内容的最大字符数；超过时按 llm_summarize 设置进行总结或截断
-max_content_length = 8192
+# max_content_length = 8192
 # 超长内容是否默认调用 LLM 总结；关闭后超长内容一律截断
-llm_summarize = true
+# llm_summarize = true
 
 [llm]
 # 总结时使用的 LLM 模型任务名（planner / replyer 等 Host 任务名，不是原始模型 ID）
-model = "planner"
+# model = "planner"
 # 总结时的采样温度
-temperature = 0.3
+# temperature = 0.3
 # 总结 LLM 调用的最大 token 数；0 表示自动按 max_content_length 的四倍计算
 # 若小于 max_content_length 会在日志中告警，输出可能被截断
-max_tokens = 0
+# max_tokens = 0
 # 总结提示词模板。占位符：{nickname}、{personality}、{reply_style}、{url}、
 # {total}、{max_length}、{focus_section}、{content}
-summarize_prompt_template = """你是{nickname}。
-你的人格设定：{personality}
-你的表达风格：{reply_style}
-
-你刚刚通过 fetch_url 工具抓取了 {url} 的内容，但内容太长了：当前 {total} 字符，需要压缩到 {max_length} 字符以内。
-请将下面的内容总结成一份不超过 {max_length} 字符的摘要，尽量保留关键信息、数据、结论与重要链接。{focus_section}
-只输出摘要正文本身，不要输出任何解释、前言或额外说明。
-
-抓取到的内容：
-{content}"""
+# summarize_prompt_template = """你是{nickname}。
+# 你的人格设定：{personality}
+# 你的表达风格：{reply_style}
+#
+# 你刚刚通过 fetch_url 工具抓取了 {url} 的内容，但内容太长了：当前 {total} 字符，需要压缩到 {max_length} 字符以内。
+# 请将下面的内容总结成一份不超过 {max_length} 字符的摘要，尽量保留关键信息、数据、结论与重要链接。{focus_section}
+# 只输出摘要正文本身，不要输出任何解释、前言或额外说明。
+#
+# 抓取到的内容：
+# {content}"""
 
 [alt_text]
 # 每次抓取最多用 VLM 描述的图片数量；页面图片超过该值时优先描述最大的几张
 # （按 HEAD Content-Length 排序）。0 表示关闭 VLM 描述（保留 jina / 原始 alt）
-max_images = 3
+# max_images = 3
 # 参与 VLM 描述的图片最短边下限（像素），用于跳过图标 / Logo
-min_dimension = 128
+# min_dimension = 128
 # 生成图片描述使用的模型任务名（默认 Host 的 vlm 任务）
-model = "vlm"
+# model = "vlm"
 # 生成图片描述的提示词
-prompt = "请用中文详细描述这张图片的内容。请留意其主题、直观感受，输出为一段平文本，如果图中有文字，请把文字复述出来。如果一共超过了1024字，请进行概括总结。请注意不要分点，就输出一段最大1024字的文本"
+# prompt = "请用中文详细描述这张图片的内容。请留意其主题、直观感受，输出为一段平文本，如果图中有文字，请把文字复述出来。如果一共超过了1024字，请进行概括总结。请注意不要分点，就输出一段最大1024字的文本"
 # 持久化描述缓存的条目上限（LRU，按图片内容哈希命中），0 表示不缓存
-cache_size = 1024
+# cache_size = 1024
 
 # 网页内嵌图送 VLM 生成 alt 描述前的转码 / 压缩（与 [image] 入站路径独立）
 # 无论原图格式与体积，始终走体积估算单次压缩后再送入 VLM；不影响 content_items 回传
 [alt_text.image]
 # 送入 VLM 前的转换目标格式，可选 webp / jpeg / png / gif（主流 VLM 均支持 webp）
-convert_format = "webp"
+# convert_format = "webp"
 # 体积估算算法的目标字节数（默认 1 MB）；实际输出允许在目标附近上下浮动（约 target × 0.9）
-target_image_size = 1048576
+# target_image_size = 1048576
 # 编码前最长边预缩放上限（像素）；超过则先等比缩到该尺寸，再按 target_image_size 估算质量 / 体积
-max_dimension = 2048
+# max_dimension = 2048
 # webp / jpeg 估算压缩的最高质量（起点）；png / gif 无质量参数，超标时只能缩像素
-max_quality = 80
+# max_quality = 80
 # webp / jpeg 估算压缩的最低质量；到达下限仍超过 target_image_size 时改为缩小图片尺寸
-min_quality = 10
+# min_quality = 10
 # 动图（GIF 等多帧图片）处理策略：
 #   keep_animated=保留动画并按目标格式编码（webp→动态 WebP，png→APNG，gif→动态 GIF）
 #   skip=与入站语义相同，但 VLM 路径仍会强制转码压缩（不会原样送入 VLM）
 #   first_frame=只保留首帧转静态图
 # 目标格式为 jpeg（无法承载动画）时 keep_animated 自动退化为首帧
-animated_policy = "keep_animated"
+# animated_policy = "keep_animated"
 # 保留动画时的帧数上限，超过则退化为首帧静态图；0 表示不限制
-max_animation_frames = 512
+# max_animation_frames = 512
