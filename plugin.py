@@ -58,6 +58,9 @@ _IMAGE_MAGIC_PREFIXES: tuple[tuple[bytes, str], ...] = (
 )
 _PDF_MAGIC = b"%PDF"
 
+# 内容类型嗅探所需的最小字节数（WEBP 需读到 [8:12]，留足余量）
+_SNIFF_MIN_BYTES = 16
+
 # Markdown 图片语法：![alt](src "title")
 _MD_IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]\n]*)\]\(\s*(?P<src>[^)\s]+)(?P<title>\s+\"[^\"]*\")?\s*\)")
 
@@ -1762,10 +1765,12 @@ class FetchUrlPlugin(MaiBotPlugin):
             content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
 
             iterator = response.aiter_bytes()
-            first_chunk = b""
+            header_bytes = bytearray()
             async for chunk in iterator:
-                first_chunk = chunk
-                break
+                header_bytes.extend(chunk)
+                if len(header_bytes) >= _SNIFF_MIN_BYTES:
+                    break
+            first_chunk = bytes(header_bytes)
 
             sniffed_mime = _sniff_image_mime(first_chunk)
             is_image = content_type.startswith("image/") or (
@@ -2346,22 +2351,22 @@ class FetchUrlPlugin(MaiBotPlugin):
                 "final_url": final_url,
             }
 
-        window, described_count = await self._apply_vlm_alt_text(window, final_url)
-
-        processed = "full"
-        body = window
+        # 注意：VLM alt 替换会改变文本长度，因此截断 / 总结的决策一律基于原始窗口
+        # （original markdown 坐标），alt 替换只作用于最终要展示的 body，避免上报的
+        # [start, end) 范围与续读偏移量因长度变化而错位。
         notice_lines = [
             f"【fetch_url】来源：{final_url}（{provider}）",
             f"文档总长 {total_chars} 字符；本次窗口 [{start}, {end})。",
         ]
-        if described_count:
-            notice_lines.append(f"已用视觉模型为 {described_count} 张图片生成描述并替换 alt 文本。")
+        processed = "full"
+        described_count = 0
 
         if len(window) > self._max_content_length:
             use_summarize = self._llm_summarize and on_exceed != "truncate"
             summary = ""
             if use_summarize:
-                summary = await self._summarize(window, final_url, summary_focus)
+                enhanced_window, described_count = await self._apply_vlm_alt_text(window, final_url)
+                summary = await self._summarize(enhanced_window, final_url, summary_focus)
             if summary:
                 processed = "summarized"
                 body = summary
@@ -2372,15 +2377,21 @@ class FetchUrlPlugin(MaiBotPlugin):
                 )
             else:
                 processed = "truncated"
-                truncate_end = start + self._max_content_length
-                body = window[: self._max_content_length]
-                end = min(end, truncate_end)
+                end = min(end, start + self._max_content_length)
+                body, described_count = await self._apply_vlm_alt_text(
+                    window[: self._max_content_length], final_url
+                )
                 reason = "" if use_summarize is False else "（LLM 总结失败，已回退为截断）"
+                notice_lines[1] = f"文档总长 {total_chars} 字符；本次窗口 [{start}, {end})。"
                 notice_lines.append(
                     f"窗口内容超过上限 {self._max_content_length} 字符，已截断至 [{start}, {end})"
                     f"{reason}；可用 start_char={end} 继续获取后续内容。"
                 )
-                notice_lines[1] = f"文档总长 {total_chars} 字符；本次窗口 [{start}, {end})。"
+        else:
+            body, described_count = await self._apply_vlm_alt_text(window, final_url)
+
+        if described_count:
+            notice_lines.insert(2, f"已用视觉模型为 {described_count} 张图片生成描述并替换 alt 文本。")
 
         content = "\n".join(notice_lines) + "\n\n" + body
         return {
