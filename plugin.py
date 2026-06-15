@@ -1,8 +1,9 @@
-"""Fetch URL 插件。
+"""网页抓取 (Fetch URL) 插件。
 
 提供单一 ``fetch_url`` 工具：
-- 网页 / PDF：优先通过 jina.ai Reader 转 Markdown，失败时回退到本地抓取 + markdownify；
+- 网页 / PDF：优先通过 jina.ai Reader 转 Markdown，失败时回退到本地抓取 + markdownify / pypdf；
 - 图片：下载后仅对不支持格式转码；可接受格式原样回传（体积压缩交由 image-recompress 等入站插件）
+- 支持抓取结果内存缓存（TTL）、JSON 友好展示、页面元信息；
 - 支持 start_char / end_char 分页窗口、超长内容 LLM 总结（注入人设）或截断；
 - 网页中的图片可由 VLM 生成描述并替换 alt 文本（优先级：VLM > jina 生成 alt > 原始 alt）。
 """
@@ -14,6 +15,7 @@ import ipaddress
 import json
 import math
 import re
+import time
 from base64 import b64encode
 from collections import OrderedDict
 from hashlib import sha256
@@ -156,6 +158,162 @@ def _sanitize_alt_text(text: str) -> str:
     sanitized = " ".join(str(text or "").split())
     sanitized = sanitized.replace("[", "［").replace("]", "］").replace("(", "（").replace(")", "）")
     return sanitized[:1024]
+
+
+def _looks_like_json(text: str) -> bool:
+    """粗略判断文本是否像 JSON。"""
+    stripped = text.lstrip("\ufeff").strip()
+    return bool(stripped) and stripped[0] in "{["
+
+
+def _format_json_as_markdown(text: str) -> str:
+    """将 JSON 文本格式化为 Markdown 代码块；解析失败时原样返回。"""
+    stripped = text.lstrip("\ufeff").strip()
+    if not stripped:
+        return text
+    try:
+        obj = json.loads(stripped)
+    except json.JSONDecodeError:
+        return text
+    formatted = json.dumps(obj, ensure_ascii=False, indent=2)
+    return f"```json\n{formatted}\n```"
+
+
+def _metadata_from_json_text(text: str) -> dict[str, str]:
+    """从 JSON 文档中提取常见展示字段。"""
+    metadata: dict[str, str] = {}
+    try:
+        obj = json.loads(text.lstrip("\ufeff").strip())
+    except json.JSONDecodeError:
+        return metadata
+    if not isinstance(obj, dict):
+        return metadata
+    field_map = (
+        ("title", ("title",)),
+        ("description", ("description", "summary", "abstract")),
+        ("published_at", ("published_at", "publish_time", "date", "created_at", "updated_at")),
+    )
+    for target, keys in field_map:
+        for key in keys:
+            value = obj.get(key)
+            if value not in (None, ""):
+                metadata[target] = str(value).strip()
+                break
+    return metadata
+
+
+def _metadata_from_markdown(markdown: str) -> dict[str, str]:
+    """从 Markdown 首行一级标题推断页面标题。"""
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# "):
+            title = stripped[2:].strip()
+            if title:
+                return {"title": title}
+            break
+    return {}
+
+
+def _extract_html_metadata(html: str) -> dict[str, str]:
+    """从 HTML 提取标题与常见 meta 字段。"""
+    soup = BeautifulSoup(html, "html.parser")
+    metadata: dict[str, str] = {}
+
+    if soup.title and soup.title.string:
+        title = soup.title.string.strip()
+        if title:
+            metadata["title"] = title
+
+    def _meta_value(*names: str) -> str:
+        for name in names:
+            tag = soup.find("meta", attrs={"name": name}) or soup.find("meta", attrs={"property": name})
+            if tag is not None:
+                content = tag.get("content")
+                if content:
+                    return str(content).strip()
+        return ""
+
+    description = _meta_value("description", "og:description", "twitter:description")
+    if description:
+        metadata["description"] = description
+
+    published_at = _meta_value(
+        "article:published_time",
+        "og:article:published_time",
+        "pubdate",
+        "date",
+        "publishdate",
+    )
+    if published_at:
+        metadata["published_at"] = published_at
+
+    og_title = _meta_value("og:title", "twitter:title")
+    if og_title and "title" not in metadata:
+        metadata["title"] = og_title
+
+    return metadata
+
+
+def _format_metadata_notice_lines(
+    metadata: Mapping[str, str],
+    *,
+    requested_url: str,
+    final_url: str,
+    content_type: str = "",
+    provider: str = "",
+    from_cache: bool = False,
+) -> list[str]:
+    """把页面元信息格式化为返回正文中的说明行。"""
+    lines: list[str] = []
+    if metadata.get("title"):
+        lines.append(f"标题：{metadata['title']}")
+    if metadata.get("description"):
+        lines.append(f"摘要：{metadata['description']}")
+    if metadata.get("published_at"):
+        lines.append(f"发布时间：{metadata['published_at']}")
+    if requested_url != final_url:
+        lines.append(f"请求 URL：{requested_url}")
+    lines.append(f"最终 URL：{final_url}")
+    if content_type:
+        lines.append(f"内容类型：{content_type}")
+    if provider:
+        lines.append(f"解析方式：{provider}")
+    if from_cache:
+        lines.append("（命中抓取缓存）")
+    return lines
+
+
+def _pdf_to_markdown_blocking(data: bytes) -> tuple[str, dict[str, str]]:
+    """用 pypdf 从 PDF 字节提取文本并转为分页 Markdown。"""
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise FetchUrlError("本地 PDF 解析需要 pypdf 依赖，请检查插件依赖是否已安装") from exc
+
+    reader = PdfReader(BytesIO(data))
+    metadata: dict[str, str] = {"content_type": "application/pdf"}
+
+    doc_info = reader.metadata
+    if doc_info is not None:
+        title = getattr(doc_info, "title", None)
+        if title:
+            metadata["title"] = str(title).strip()
+        author = getattr(doc_info, "author", None)
+        if author:
+            metadata["author"] = str(author).strip()
+
+    parts: list[str] = []
+    for index, page in enumerate(reader.pages, start=1):
+        text = (page.extract_text() or "").strip()
+        if text:
+            parts.append(f"## 第 {index} 页\n\n{text}")
+
+    if not parts:
+        raise FetchUrlError(
+            "未能从 PDF 提取到文本（可能是扫描件或图片型 PDF），请启用 jina 后重试"
+        )
+
+    return "\n\n".join(parts), metadata
 
 
 def _is_private_address(address: str) -> bool:
@@ -754,12 +912,63 @@ class AltTextCache:
             pass
 
 
+class FetchResultCache:
+    """抓取原始结果的内存 LRU 缓存（带 TTL）。
+
+    缓存命中后仍会按 ``start_char`` / ``end_char`` 做窗口切片，以及按需执行
+    VLM alt 替换与 LLM 总结，因此只缓存网络抓取后的原始 Markdown / 图片字节。
+    """
+
+    def __init__(self, max_entries: int, ttl_seconds: float) -> None:
+        self._max_entries = max(0, max_entries)
+        self._ttl_seconds = max(0.0, float(ttl_seconds))
+        self._entries: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
+
+    def get(self, key: str) -> dict[str, Any] | None:
+        """读取未过期的缓存条目。"""
+        if self._max_entries <= 0 or self._ttl_seconds <= 0:
+            return None
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        stored_at, payload = entry
+        if time.monotonic() - stored_at > self._ttl_seconds:
+            self._entries.pop(key, None)
+            return None
+        self._entries.move_to_end(key)
+        return payload
+
+    def put(self, key: str, payload: dict[str, Any]) -> None:
+        """写入缓存并淘汰最旧条目。"""
+        if self._max_entries <= 0 or self._ttl_seconds <= 0:
+            return
+        self._entries[key] = (time.monotonic(), payload)
+        self._entries.move_to_end(key)
+        while len(self._entries) > self._max_entries:
+            self._entries.popitem(last=False)
+
+    def set_limits(self, max_entries: int, ttl_seconds: float) -> None:
+        """热更新容量与 TTL。"""
+        self._max_entries = max(0, max_entries)
+        self._ttl_seconds = max(0.0, float(ttl_seconds))
+        now = time.monotonic()
+        expired = [
+            key
+            for key, (stored_at, _) in self._entries.items()
+            if now - stored_at > self._ttl_seconds
+        ]
+        for key in expired:
+            self._entries.pop(key, None)
+        while len(self._entries) > self._max_entries:
+            self._entries.popitem(last=False)
+
+
 # --------------------------------------------------------------------------- #
 # 配置版本迁移
 # --------------------------------------------------------------------------- #
 
 # 与 PluginSectionConfig.config_version 默认值保持同步
-CURRENT_CONFIG_VERSION = "1.6.0"
+CURRENT_CONFIG_VERSION = "1.7.0"
 
 DEFAULT_FETCH_TIMEOUT = 15.0
 DEFAULT_FETCH_MAX_DOWNLOAD_SIZE = 64 * 1024 * 1024
@@ -779,6 +988,9 @@ DEFAULT_ALT_MAX_IMAGES = 3
 DEFAULT_ALT_MIN_DIMENSION = 128
 DEFAULT_ALT_MODEL = "vlm"
 DEFAULT_ALT_CACHE_SIZE = 1024
+DEFAULT_FETCH_CACHE_ENABLED = True
+DEFAULT_FETCH_CACHE_TTL_SECONDS = 30 * 60
+DEFAULT_FETCH_CACHE_MAX_ENTRIES = 128
 
 _LEGACY_DEFAULTS: dict[str, dict[str, Any]] = {
     "fetch.max_download_size": {"<1.5.0": 16 * 1024 * 1024},
@@ -816,6 +1028,9 @@ _CURRENT_DEFAULTS: dict[str, Any] = {
     "alt_text.model": DEFAULT_ALT_MODEL,
     "alt_text.prompt": DEFAULT_ALT_TEXT_PROMPT,
     "alt_text.cache_size": DEFAULT_ALT_CACHE_SIZE,
+    "cache.enabled": DEFAULT_FETCH_CACHE_ENABLED,
+    "cache.ttl_seconds": DEFAULT_FETCH_CACHE_TTL_SECONDS,
+    "cache.max_entries": DEFAULT_FETCH_CACHE_MAX_ENTRIES,
     "alt_text.image.target_image_size": 1024 * 1024,
     "alt_text.image.max_dimension": 2048,
     "alt_text.image.max_quality": 80,
@@ -1329,6 +1544,30 @@ class AltTextSectionConfig(PluginConfigBase):
     image: AltTextImageSectionConfig = Field(default_factory=AltTextImageSectionConfig)
 
 
+class CacheSectionConfig(PluginConfigBase):
+    """抓取原始结果内存缓存。"""
+
+    __ui_label__ = "抓取缓存"
+    __ui_icon__ = "database"
+    __ui_order__ = 7
+
+    enabled: bool | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": "true"},
+        description="是否缓存抓取原始结果（Markdown / 图片字节），减少重复网络请求。",
+    )
+    ttl_seconds: int | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": str(DEFAULT_FETCH_CACHE_TTL_SECONDS)},
+        description="缓存条目存活时间（秒），默认 30 分钟；0 表示关闭 TTL（等同关闭缓存）。",
+    )
+    max_entries: int | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": str(DEFAULT_FETCH_CACHE_MAX_ENTRIES)},
+        description="内存中最多保留的缓存条目数，超出时淘汰最久未使用的条目。",
+    )
+
+
 class FetchUrlConfig(PluginConfigBase):
     """插件完整配置。"""
 
@@ -1339,6 +1578,7 @@ class FetchUrlConfig(PluginConfigBase):
     content: ContentSectionConfig = Field(default_factory=ContentSectionConfig)
     llm: LLMSectionConfig = Field(default_factory=LLMSectionConfig)
     alt_text: AltTextSectionConfig = Field(default_factory=AltTextSectionConfig)
+    cache: CacheSectionConfig = Field(default_factory=CacheSectionConfig)
 
 
 # --------------------------------------------------------------------------- #
@@ -1383,6 +1623,9 @@ class EffectiveFetchUrlConfig:
     alt_image_min_quality: int
     alt_image_animated_policy: str
     alt_image_max_animation_frames: int
+    fetch_cache_enabled: bool
+    fetch_cache_ttl_seconds: int
+    fetch_cache_max_entries: int
 
 
 def _effective_bool(value: bool | None, default: bool) -> bool:
@@ -1476,6 +1719,13 @@ def resolve_effective_fetch_url_config(cfg: FetchUrlConfig) -> EffectiveFetchUrl
         alt_image_max_animation_frames=max(
             0, _effective_int(alt_image.max_animation_frames, 512)
         ),
+        fetch_cache_enabled=_effective_bool(cfg.cache.enabled, DEFAULT_FETCH_CACHE_ENABLED),
+        fetch_cache_ttl_seconds=max(
+            0, _effective_int(cfg.cache.ttl_seconds, DEFAULT_FETCH_CACHE_TTL_SECONDS)
+        ),
+        fetch_cache_max_entries=max(
+            0, _effective_int(cfg.cache.max_entries, DEFAULT_FETCH_CACHE_MAX_ENTRIES)
+        ),
     )
 
 
@@ -1533,6 +1783,10 @@ class FetchUrlPlugin(MaiBotPlugin):
         self._alt_image_animated_policy = "keep_animated"
         self._alt_image_max_animation_frames = 512
         self._always_visible_for_planner = False
+        self._fetch_cache: FetchResultCache | None = None
+        self._fetch_cache_enabled = True
+        self._fetch_cache_ttl_seconds = DEFAULT_FETCH_CACHE_TTL_SECONDS
+        self._fetch_cache_max_entries = DEFAULT_FETCH_CACHE_MAX_ENTRIES
         self._config_initialized = False
 
     # ------------------------------------------------------------------ #
@@ -1544,12 +1798,18 @@ class FetchUrlPlugin(MaiBotPlugin):
         cache_path = self._plugin_dir / "data" / "alt_text_cache.json"
         self._alt_cache = AltTextCache(cache_path, self._alt_cache_size)
         self._alt_cache.load()
+        self._fetch_cache = FetchResultCache(self._fetch_cache_max_entries, self._fetch_cache_ttl_seconds)
         self.ctx.logger.info(
-            "fetch_url 插件已加载：jina=%s, 总结=%s, VLM描述上限=%d 张, 描述缓存=%d 条, Planner常显=%s",
+            "fetch_url 插件已加载：jina=%s, 总结=%s, VLM描述上限=%d 张, 描述缓存=%d 条, 抓取缓存=%s, Planner常显=%s",
             "开" if self._jina_enabled else "关",
             "开" if self._llm_summarize else "关",
             self._alt_max_images,
             self._alt_cache_size,
+            (
+                f"开({self._fetch_cache_max_entries} 条 / {self._fetch_cache_ttl_seconds}s)"
+                if self._fetch_cache_enabled
+                else "关"
+            ),
             "开" if self._always_visible_for_planner else "关",
         )
 
@@ -1567,6 +1827,8 @@ class FetchUrlPlugin(MaiBotPlugin):
             self._vlm_available = None
             if self._alt_cache is not None:
                 self._alt_cache.set_max_entries(self._alt_cache_size)
+            if self._fetch_cache is not None:
+                self._fetch_cache.set_limits(self._fetch_cache_max_entries, self._fetch_cache_ttl_seconds)
             self.ctx.logger.info("fetch_url 插件配置已更新: version=%s", version)
 
     def normalize_plugin_config(
@@ -1671,6 +1933,14 @@ class FetchUrlPlugin(MaiBotPlugin):
         self._alt_image_animated_policy = alt_animated_policy
         self._alt_image_max_animation_frames = effective.alt_image_max_animation_frames
 
+        self._fetch_cache_ttl_seconds = effective.fetch_cache_ttl_seconds
+        self._fetch_cache_max_entries = effective.fetch_cache_max_entries
+        self._fetch_cache_enabled = (
+            effective.fetch_cache_enabled
+            and self._fetch_cache_ttl_seconds > 0
+            and self._fetch_cache_max_entries > 0
+        )
+
         self._warn_if_summarize_max_tokens_too_low(self._resolve_summarize_max_tokens())
 
     def _resolve_summarize_max_tokens(self) -> int:
@@ -1742,6 +2012,40 @@ class FetchUrlPlugin(MaiBotPlugin):
             if host == domain or host.endswith("." + domain):
                 parts.append(cookie)
         return "; ".join(part.strip().strip(";") for part in parts if part.strip())
+
+    def _fetch_cache_key(self, url: str) -> str:
+        """按 URL、User-Agent 与 Cookie 生成抓取缓存键。"""
+        cookie_header = self._cookie_header_for(url)
+        raw = f"{url.strip()}\n{self._user_agent}\n{cookie_header}"
+        return sha256(raw.encode("utf-8")).hexdigest()
+
+    def _store_fetch_cache(self, cache_key: str, payload: dict[str, Any]) -> None:
+        if self._fetch_cache_enabled and self._fetch_cache is not None:
+            self._fetch_cache.put(cache_key, payload)
+
+    def _text_content_to_markdown(
+        self,
+        text: str,
+        *,
+        content_type: str,
+        base_url: str,
+    ) -> tuple[str, dict[str, str]]:
+        """把探测到的文本 / HTML / JSON 正文转为 Markdown，并提取元信息。"""
+        metadata: dict[str, str] = {"content_type": content_type or "text/plain"}
+
+        if content_type == "application/json" or _looks_like_json(text):
+            metadata.update(_metadata_from_json_text(text))
+            return _format_json_as_markdown(text), metadata
+
+        if "html" in content_type or content_type in {"", "application/octet-stream"}:
+            metadata.update(_extract_html_metadata(text))
+            markdown = self._html_to_markdown_blocking(text, base_url)
+            return markdown, metadata
+
+        if content_type.startswith("text/") or content_type in {"application/xml"}:
+            return text, metadata
+
+        raise FetchUrlError(f"不支持直接解析的内容类型：{content_type or '未知'}（可尝试启用 jina）")
 
     # ------------------------------------------------------------------ #
     # 抓取与内容类型探测
@@ -1837,23 +2141,22 @@ class FetchUrlPlugin(MaiBotPlugin):
                 raise FetchUrlError("jina 返回内容超过下载大小上限")
             return response.text
 
-    async def _fetch_direct_markdown(self, client: httpx.AsyncClient, url: str) -> tuple[str, str]:
-        """直接抓取页面并用 markdownify 转为 Markdown。
+    async def _fetch_direct_markdown(
+        self, client: httpx.AsyncClient, url: str
+    ) -> tuple[str, str, dict[str, str]]:
+        """直接抓取页面并转为 Markdown。
 
         Returns:
-            tuple: ``(markdown, final_url)``。
+            tuple: ``(markdown, final_url, metadata)``。
         """
         probe = await self._probe_url_force_text(client, url)
         content_type: str = probe["content_type"]
         final_url: str = probe["final_url"]
         text = probe["data"].decode(probe["encoding"], errors="replace")
-
-        if "html" in content_type or content_type in {"", "application/octet-stream"}:
-            markdown = await asyncio.to_thread(self._html_to_markdown_blocking, text, final_url)
-            return markdown, final_url
-        if content_type.startswith("text/") or content_type in {"application/json", "application/xml"}:
-            return text, final_url
-        raise FetchUrlError(f"不支持直接解析的内容类型：{content_type or '未知'}（可尝试启用 jina）")
+        markdown, metadata = self._text_content_to_markdown(
+            text, content_type=content_type, base_url=final_url
+        )
+        return markdown, final_url, metadata
 
     async def _probe_url_force_text(self, client: httpx.AsyncClient, url: str) -> dict[str, Any]:
         """强制按文本下载完整正文（jina 回退路径使用）。"""
@@ -2195,19 +2498,62 @@ class FetchUrlPlugin(MaiBotPlugin):
             raise FetchUrlError("URL 缺少有效的主机名")
         await self._assert_host_allowed(parsed.hostname)
 
+        cache_key = self._fetch_cache_key(url)
+        if self._fetch_cache_enabled and self._fetch_cache is not None:
+            cached = self._fetch_cache.get(cache_key)
+            if cached is not None:
+                if cached["kind"] == "image":
+                    return await self._build_image_result(
+                        url,
+                        cached["probe"],
+                        metadata=cached.get("metadata", {}),
+                        from_cache=True,
+                    )
+                return await self._build_text_result(
+                    markdown=cached["markdown"],
+                    provider=cached["provider"],
+                    url=url,
+                    final_url=cached["final_url"],
+                    metadata=cached.get("metadata", {}),
+                    content_type=cached.get("content_type", ""),
+                    start_char=start_char,
+                    end_char=end_char,
+                    on_exceed=on_exceed,
+                    summary_focus=summary_focus,
+                    from_cache=True,
+                )
+
         async with self._build_client() as client:
             probe = await self._probe_url(client, url)
 
             if probe["kind"] == "image":
-                return await self._build_image_result(url, probe)
+                metadata = {"content_type": probe.get("content_type", "image/*")}
+                self._store_fetch_cache(
+                    cache_key,
+                    {"kind": "image", "probe": probe, "metadata": metadata},
+                )
+                return await self._build_image_result(url, probe, metadata=metadata)
 
-            markdown, provider, final_url = await self._fetch_text_content(client, url, probe)
+            markdown, provider, final_url, metadata = await self._fetch_text_content(client, url, probe)
 
+        self._store_fetch_cache(
+            cache_key,
+            {
+                "kind": "text",
+                "markdown": markdown,
+                "provider": provider,
+                "final_url": final_url,
+                "metadata": metadata,
+                "content_type": metadata.get("content_type", ""),
+            },
+        )
         return await self._build_text_result(
             markdown=markdown,
             provider=provider,
             url=url,
             final_url=final_url,
+            metadata=metadata,
+            content_type=metadata.get("content_type", ""),
             start_char=start_char,
             end_char=end_char,
             on_exceed=on_exceed,
@@ -2219,19 +2565,21 @@ class FetchUrlPlugin(MaiBotPlugin):
         client: httpx.AsyncClient,
         url: str,
         probe: dict[str, Any],
-    ) -> tuple[str, str, str]:
+    ) -> tuple[str, str, str, dict[str, str]]:
         """获取非图片内容的 Markdown 文本。
 
         Returns:
-            tuple: ``(markdown, provider, final_url)``。
+            tuple: ``(markdown, provider, final_url, metadata)``。
         """
         is_pdf = probe["kind"] == "pdf"
+        metadata: dict[str, str] = {"content_type": probe.get("content_type", "")}
 
         if self._jina_enabled:
             try:
                 markdown = await self._fetch_via_jina(url)
                 if markdown.strip():
-                    return markdown.strip(), "jina", probe["final_url"]
+                    metadata.update(_metadata_from_markdown(markdown))
+                    return markdown.strip(), "jina", probe["final_url"], metadata
                 raise FetchUrlError("jina 返回了空内容")
             except FetchUrlError as exc:
                 self.ctx.logger.warning("jina 抓取失败，回退本地抓取：url=%s, error=%s", url, exc)
@@ -2241,26 +2589,37 @@ class FetchUrlPlugin(MaiBotPlugin):
                 )
 
         if is_pdf:
-            raise FetchUrlError(
-                "该 URL 是 PDF 文件，本地解析器不支持 PDF；请启用 jina（或检查 jina 可用性）后重试"
-            )
+            pdf_probe = await self._probe_url_force_text(client, url)
+            pdf_bytes = pdf_probe["data"]
+            final_url = pdf_probe["final_url"]
+            markdown, pdf_metadata = await asyncio.to_thread(_pdf_to_markdown_blocking, pdf_bytes)
+            metadata.update(pdf_metadata)
+            return markdown, "pypdf", final_url, metadata
 
         if probe["kind"] == "text":
             text = probe["data"].decode(probe["encoding"], errors="replace")
             content_type = probe["content_type"]
-            if "html" in content_type or content_type in {"", "application/octet-stream"}:
-                markdown = await asyncio.to_thread(
-                    self._html_to_markdown_blocking, text, probe["final_url"]
-                )
-            else:
-                markdown = text
-            return markdown, "markdownify", probe["final_url"]
+            markdown, content_metadata = self._text_content_to_markdown(
+                text, content_type=content_type, base_url=probe["final_url"]
+            )
+            metadata.update(content_metadata)
+            return markdown, "markdownify", probe["final_url"], metadata
 
-        markdown, final_url = await self._fetch_direct_markdown(client, url)
-        return markdown, "markdownify", final_url
+        markdown, final_url, content_metadata = await self._fetch_direct_markdown(client, url)
+        metadata.update(content_metadata)
+        return markdown, "markdownify", final_url, metadata
 
-    async def _build_image_result(self, url: str, probe: dict[str, Any]) -> dict[str, Any]:
+    async def _build_image_result(
+        self,
+        url: str,
+        probe: dict[str, Any],
+        *,
+        metadata: dict[str, str] | None = None,
+        from_cache: bool = False,
+    ) -> dict[str, Any]:
         """图片路径：转码 / 压缩后通过 content_items 回传。"""
+        page_metadata = dict(metadata or {})
+        page_metadata.setdefault("content_type", probe.get("content_type", "image/*"))
         try:
             info = await asyncio.to_thread(
                 _normalize_inbound_image_blocking,
@@ -2286,16 +2645,24 @@ class FetchUrlPlugin(MaiBotPlugin):
         if info["downscaled"]:
             notes.append("已缩小尺寸")
         note_text = f"（{'，'.join(notes)}）" if notes else ""
+        meta_lines = _format_metadata_notice_lines(
+            page_metadata,
+            requested_url=url,
+            final_url=probe["final_url"],
+            provider="image",
+            from_cache=from_cache,
+        )
 
-        content = (
-            f"已获取图片：{probe['final_url']}\n"
-            f"格式 {info['format']}，尺寸 {info['width']}x{info['height']}，"
+        content = "已获取图片：\n" + "\n".join(meta_lines) + (
+            f"\n格式 {info['format']}，尺寸 {info['width']}x{info['height']}，"
             f"大小 {len(info['data'])} 字节{note_text}。图片内容见对应的媒体消息。"
         )
         return {
             "success": True,
             "content": content,
             "final_url": probe["final_url"],
+            "metadata": page_metadata,
+            "cached": from_cache,
             "content_items": [
                 {
                     "content_type": "image",
@@ -2325,39 +2692,61 @@ class FetchUrlPlugin(MaiBotPlugin):
         provider: str,
         url: str,
         final_url: str,
+        metadata: dict[str, str] | None = None,
+        content_type: str = "",
         start_char: int,
         end_char: int,
         on_exceed: str,
         summary_focus: str,
+        from_cache: bool = False,
     ) -> dict[str, Any]:
         """文本路径：窗口切片 + VLM alt 替换 + 超长总结 / 截断。"""
+        page_metadata = dict(metadata or {})
+        if content_type:
+            page_metadata.setdefault("content_type", content_type)
         total_chars = len(markdown)
         start = max(0, min(start_char, total_chars))
         end = total_chars if end_char < 0 else max(start, min(end_char, total_chars))
         window = markdown[start:end]
 
         if not window:
+            meta_lines = _format_metadata_notice_lines(
+                page_metadata,
+                requested_url=url,
+                final_url=final_url,
+                content_type=page_metadata.get("content_type", content_type),
+                provider=provider,
+                from_cache=from_cache,
+            )
             return {
                 "success": True,
                 "content": (
-                    f"【fetch_url】来源：{final_url}（{provider}）\n"
-                    f"文档总长 {total_chars} 字符，但请求的窗口 [{start}, {end}) 为空。"
-                    f"请调整 start_char / end_char 后重试。"
+                    "【fetch_url】\n"
+                    + "\n".join(meta_lines)
+                    + f"\n文档总长 {total_chars} 字符，但请求的窗口 [{start}, {end}) 为空。"
+                    + "请调整 start_char / end_char 后重试。"
                 ),
                 "total_chars": total_chars,
                 "returned_range": [start, end],
                 "processed": "empty",
                 "provider": provider,
                 "final_url": final_url,
+                "metadata": page_metadata,
+                "cached": from_cache,
             }
 
         # 注意：VLM alt 替换会改变文本长度，因此截断 / 总结的决策一律基于原始窗口
         # （original markdown 坐标），alt 替换只作用于最终要展示的 body，避免上报的
         # [start, end) 范围与续读偏移量因长度变化而错位。
-        notice_lines = [
-            f"【fetch_url】来源：{final_url}（{provider}）",
-            f"文档总长 {total_chars} 字符；本次窗口 [{start}, {end})。",
-        ]
+        meta_lines = _format_metadata_notice_lines(
+            page_metadata,
+            requested_url=url,
+            final_url=final_url,
+            content_type=page_metadata.get("content_type", content_type),
+            provider=provider,
+            from_cache=from_cache,
+        )
+        notice_lines = ["【fetch_url】", *meta_lines, f"文档总长 {total_chars} 字符；本次窗口 [{start}, {end})。"]
         processed = "full"
         described_count = 0
 
@@ -2402,6 +2791,8 @@ class FetchUrlPlugin(MaiBotPlugin):
             "processed": processed,
             "provider": provider,
             "final_url": final_url,
+            "metadata": page_metadata,
+            "cached": from_cache,
         }
 
 

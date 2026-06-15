@@ -1,4 +1,4 @@
-# Fetch URL 插件配置
+# 网页抓取 (Fetch URL) 插件配置
 #
 # 各配置节下的数值、字符串与布尔字段留空（或不写）即使用插件代码中的内置默认；
 # 仅在你需要覆盖默认值时再填写。插件升级后修改内置默认时，留空字段会自动跟随新默认。
@@ -7,7 +7,7 @@
 # 是否启用插件
 enabled = true
 # 配置版本（低于插件模型默认值时，Runner 会触发迁移并写回）
-config_version = "1.6.0"
+config_version = "1.7.0"
 # 是否让 fetch_url 始终对 Planner 可见（无需 tool_search 发现）。修改后需重新加载插件才能生效
 # always_visible_for_planner = false
 
@@ -16,7 +16,7 @@ config_version = "1.6.0"
 # timeout = 15.0
 # 抓取内容时使用的代理地址（例如 "http://127.0.0.1:7890"）；留空表示不使用代理
 proxy = ""
-# 抓取时使用的 User-Agent
+# 抓取时使用的 User-Agent（留空则使用内置 Chrome 风格 UA）
 # user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 # 单次下载的最大字节数（默认 64 MB），超过即中止并报错
 # max_download_size = 67108864
@@ -30,6 +30,14 @@ cookies = ""
 # 示例：
 #   "example.com" = "session=xxx; token=yyy"
 [fetch.domain_cookies]
+
+[cache]
+# 是否缓存抓取原始结果（Markdown / 图片字节），减少重复网络请求
+# enabled = true
+# 缓存条目存活时间（秒），默认 30 分钟；0 表示关闭 TTL（等同关闭缓存）
+# ttl_seconds = 1800
+# 内存中最多保留的缓存条目数，超出时淘汰最久未使用的条目
+# max_entries = 128
 
 [jina]
 # 是否优先使用 jina.ai Reader 抓取非图片内容（支持网页 / PDF，质量更好）

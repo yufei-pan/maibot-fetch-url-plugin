@@ -188,12 +188,77 @@ def test_resolve_effective_defaults() -> None:
     assert eff.jina_engine == "browser"
     assert eff.convert_format == "webp"
     assert eff.alt_image_target_size == 1024 * 1024
+    assert eff.fetch_cache_enabled is True
+    assert eff.fetch_cache_ttl_seconds == 30 * 60
+    assert eff.fetch_cache_max_entries == 128
+    assert eff.user_agent == fetch_plugin.DEFAULT_USER_AGENT
 
     auto_cfg = fetch_plugin.FetchUrlConfig(
         jina=fetch_plugin.JinaSectionConfig(engine=""),
     )
     assert fetch_plugin.resolve_effective_fetch_url_config(auto_cfg).jina_engine == ""
     print("ok: resolve effective defaults")
+
+
+def test_fetch_result_cache_ttl() -> None:
+    cache = fetch_plugin.FetchResultCache(max_entries=2, ttl_seconds=1)
+    cache.put("a", {"kind": "text", "markdown": "hello"})
+    assert cache.get("a") == {"kind": "text", "markdown": "hello"}
+    cache.put("b", {"kind": "text", "markdown": "world"})
+    cache.put("c", {"kind": "text", "markdown": "third"})
+    assert cache.get("a") is None
+    assert cache.get("c") == {"kind": "text", "markdown": "third"}
+
+    cache.put("expire", {"kind": "text", "markdown": "soon"})
+    entry = cache._entries["expire"]
+    cache._entries["expire"] = (entry[0] - 2, entry[1])
+    assert cache.get("expire") is None
+    print("ok: fetch result cache TTL + LRU eviction")
+
+
+def test_json_format_and_metadata() -> None:
+    raw = '{"title":"示例","description":"说明","count":3}'
+    formatted = fetch_plugin._format_json_as_markdown(raw)
+    assert formatted.startswith("```json")
+    assert '"title": "示例"' in formatted
+    metadata = fetch_plugin._metadata_from_json_text(raw)
+    assert metadata["title"] == "示例"
+    assert metadata["description"] == "说明"
+    print("ok: JSON formatting + metadata extraction")
+
+
+def test_html_metadata_extraction() -> None:
+    html = (
+        "<html><head><title>页面标题</title>"
+        '<meta name="description" content="页面摘要">'
+        '<meta property="article:published_time" content="2026-01-01T00:00:00Z">'
+        "</head><body><p>正文</p></body></html>"
+    )
+    metadata = fetch_plugin._extract_html_metadata(html)
+    assert metadata["title"] == "页面标题"
+    assert metadata["description"] == "页面摘要"
+    assert metadata["published_at"] == "2026-01-01T00:00:00Z"
+    print("ok: HTML metadata extraction")
+
+
+def test_pdf_to_markdown_blocking_blank_pdf() -> None:
+    try:
+        from pypdf import PdfWriter
+    except ImportError:
+        print("skip: pypdf not installed")
+        return
+
+    buffer = BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.write(buffer)
+    try:
+        fetch_plugin._pdf_to_markdown_blocking(buffer.getvalue())
+    except fetch_plugin.FetchUrlError as exc:
+        assert "未能从 PDF 提取到文本" in str(exc)
+    else:
+        raise AssertionError("空白 PDF 应触发可读错误")
+    print("ok: blank PDF local extraction error path")
 
 
 def test_plugin_importable() -> None:
@@ -453,6 +518,10 @@ def main() -> None:
     test_get_components_planner_visibility()
     test_plugin_importable()
     test_resolve_effective_defaults()
+    test_fetch_result_cache_ttl()
+    test_json_format_and_metadata()
+    test_html_metadata_extraction()
+    test_pdf_to_markdown_blocking_blank_pdf()
     test_config_migration_from_1_2_0()
     test_config_migration_alt_text_image_renames()
     test_inbound_passthrough_acceptable_format()

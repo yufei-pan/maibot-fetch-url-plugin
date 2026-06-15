@@ -1,9 +1,12 @@
-# MaiBot Fetch URL 插件
+# MaiBot 网页抓取插件 (Fetch URL)
 
 为麦麦提供 `fetch_url` 工具：抓取任意 URL 并智能分流处理。
 
-- **网页 / PDF** → 优先通过 [jina.ai Reader](https://jina.ai/reader/) 转为 Markdown（PDF 也支持）；jina 失败或关闭时回退到本地抓取 + markdownify
+- **网页 / PDF** → 优先通过 [jina.ai Reader](https://jina.ai/reader/) 转为 Markdown（PDF 也支持）；jina 失败或关闭时回退到本地抓取 + markdownify，PDF 另支持 pypdf 本地提取文本
 - **图片** → 下载后按配置自动转码 / 压缩，直接以图像形式回传给麦麦观察
+- **抓取缓存** → 原始抓取结果内存缓存（默认 30 分钟 TTL、128 条上限），分页 / 总结在缓存命中后仍按参数执行
+- **JSON API** → `application/json` 响应自动格式化为 Markdown 代码块
+- **页面元信息** → 返回标题、摘要、发布时间、最终 URL 等
 - **超长内容** → 默认调用 LLM（注入麦麦人设）总结，或按需截断；支持 `start_char` / `end_char` 分页读取原文
 - **网页图片** → 自动用 VLM 为页面中最大的几张图片生成中文描述并替换 alt 文本，描述结果持久缓存
 
@@ -17,7 +20,7 @@
 | 类型        | 处理方式                                      |
 | --------- | ----------------------------------------- |
 | `image/`* | 下载 → 校验 → 可接受格式原样回传 / 不支持格式转码 → 以 `content_items` 回传 |
-| PDF       | jina Reader 转 Markdown（本地解析器不支持 PDF）      |
+| PDF       | jina Reader 转 Markdown；jina 不可用时回退 pypdf 本地提取文本      |
 | HTML / 文本 | jina Reader（默认）或本地 markdownify            |
 
 
@@ -69,6 +72,7 @@
 | ---------------------------------------- | ----------------- | ------------------------------ |
 | `plugin.always_visible_for_planner`      | false             | 让 `fetch_url` 始终对 Planner 可见（无需 `tool_search`）；**修改后需重新加载插件** |
 | `fetch.timeout`                          | 15                | 直接抓取超时（秒）                      |
+| `fetch.user_agent`                       | Chrome 风格 UA    | 抓取时使用的 User-Agent              |
 | `fetch.proxy`                            | （空）               | 代理地址，如 `http://127.0.0.1:7890` |
 | `fetch.cookies` / `fetch.domain_cookies` | （空）               | 全局 / 按域名 Cookie                |
 | `fetch.allow_private_networks`           | false             | 是否允许抓取内网地址（SSRF 防护）            |
@@ -91,6 +95,9 @@
 | `alt_text.image.max_quality`             | 80                | webp/jpeg 最高质量                       |
 | `alt_text.image.min_quality`             | 10                | webp/jpeg 最低质量                       |
 | `alt_text.image.animated_policy`         | keep_animated     | VLM 动图策略                           |
+| `cache.enabled`                          | true              | 是否缓存抓取原始结果                     |
+| `cache.ttl_seconds`                      | 1800              | 抓取缓存 TTL（秒）                      |
+| `cache.max_entries`                      | 128               | 抓取缓存条目上限                         |
 
 
 > **安全提醒**：`fetch.cookies`、`fetch.domain_cookies`、`jina.api_key` 属于敏感信息，请勿提交到版本库。
@@ -133,7 +140,7 @@ PYTHONPATH=<maibot-plugin-sdk 路径> python tests/smoke_test.py
 ## 常见问题
 
 - **抓取内网地址被拦截**：默认开启 SSRF 防护，确有需要时打开 `fetch.allow_private_networks`
-- **PDF 抓取失败**：PDF 仅支持通过 jina 解析，请确认 `jina.enabled = true` 且 jina 可达
+- **PDF 抓取失败**：优先确认 `jina.enabled = true` 且 jina 可达；jina 不可用时插件会尝试 pypdf 本地提取（扫描件 / 图片型 PDF 仍可能需要 jina）
 - **图片描述没有生效**：确认 Host 已配置 `vlm` 模型任务（与麦麦收图识别共用），且 `alt_text.max_images > 0`
 - **总结质量不佳**：可调整 `llm.model`（如换成 `replyer`）或自定义 `llm.summarize_prompt_template`
 - **需要登录的页面**：在 `fetch.domain_cookies` 中为对应域名配置 Cookie

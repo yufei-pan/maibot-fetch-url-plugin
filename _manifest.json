@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "com.0-hz.fetch-url",
-  "version": "0.2.4",
-  "name": "Fetch URL",
-  "description": "提供 fetch_url 工具：抓取任意 URL，网页 / PDF 通过 jina.ai Reader（或本地 markdownify 兜底）转为 Markdown，图片按入站/VLM 双路径处理后直接回传给麦麦观察。支持分页读取、超长内容 LLM 总结、VLM 图片描述替换 alt 文本。",
+  "version": "0.2.5",
+  "name": "网页抓取 (Fetch URL)",
+  "description": "提供 fetch_url 工具：抓取任意 URL，网页 / PDF 通过 jina.ai Reader（或本地 markdownify / pypdf 兜底）转为 Markdown，图片按入站/VLM 双路径处理后直接回传给麦麦观察。支持抓取结果内存缓存、JSON 友好展示、页面元信息、分页读取、超长内容 LLM 总结、VLM 图片描述替换 alt 文本。",
   "author": {
     "name": "kes",
     "url": "https://github.com/yufei-pan"
@@ -43,6 +43,11 @@
       "type": "python_package",
       "name": "pillow",
       "version_spec": ">=10.0.0"
+    },
+    {
+      "type": "python_package",
+      "name": "pypdf",
+      "version_spec": ">=4.0.0"
     }
   ],
   "capabilities": [
