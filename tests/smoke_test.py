@@ -282,6 +282,44 @@ def test_plugin_importable() -> None:
     print("ok: plugin importable, config model consistent")
 
 
+def _assert_no_none(value: object, path: str = "$") -> None:
+    assert value is not None, f"配置含 None：{path}"
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            _assert_no_none(nested, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            _assert_no_none(nested, f"{path}[{index}]")
+
+
+
+
+def test_webui_blank_optional_scalars_normalize() -> None:
+    """WebUI 清空 Optional 数值字段会提交空字符串，应视为留空跟随内置默认。"""
+    instance = fetch_plugin.create_plugin()
+    normalized, _ = instance.normalize_plugin_config(
+        {
+            "plugin": {"enabled": True, "config_version": fetch_plugin.CURRENT_CONFIG_VERSION},
+            "fetch": {"timeout": "", "max_download_size": "  "},
+            "alt_text": {"cache_size": "", "image": {"max_quality": ""}},
+        }
+    )
+    _assert_no_none(normalized)
+    assert "timeout" not in normalized.get("fetch", {})
+    assert "cache_size" not in normalized.get("alt_text", {})
+    print("ok: webui blank optional scalars normalize to defaults")
+
+
+def test_normalize_omits_none_for_toml_persist() -> None:
+    """WebUI 保存会走 normalize → tomlkit；Optional 默认 None 必须被剔除。"""
+    instance = fetch_plugin.create_plugin()
+    normalized, _ = instance.normalize_plugin_config({})
+    _assert_no_none(normalized)
+    assert "max_download_size" not in normalized["fetch"]
+    assert "cache_size" not in normalized["alt_text"]
+    print("ok: normalize omits None for toml persist")
+
+
 def test_inbound_passthrough_acceptable_format() -> None:
     data = _make_image_bytes("png", (64, 64))
     result = fetch_plugin._normalize_inbound_image_blocking(data, **_INBOUND)
@@ -517,6 +555,8 @@ def main() -> None:
 
     test_get_components_planner_visibility()
     test_plugin_importable()
+    test_normalize_omits_none_for_toml_persist()
+    test_webui_blank_optional_scalars_normalize()
     test_resolve_effective_defaults()
     test_fetch_result_cache_ttl()
     test_json_format_and_metadata()
