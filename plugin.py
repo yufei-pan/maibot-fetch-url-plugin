@@ -102,9 +102,9 @@ DEFAULT_ALT_TEXT_PROMPT = (
     "请注意不要分点，就输出一段最大1024字的文本"
 )
 
-DEFAULT_SUMMARIZE_PROMPT_TEMPLATE = """你是{nickname}。
-你的人格设定：{personality}
-你的表达风格：{reply_style}
+DEFAULT_SUMMARIZE_PROMPT_TEMPLATE = """你是网页抓取模块，是名为「{nickname}」的人工智能生命体的一部分。
+{nickname}的人格设定：{personality}
+{nickname}的表达风格：{reply_style}
 
 你刚刚通过 fetch_url 工具抓取了 {url} 的内容，但内容太长了：当前 {total} 字符，需要压缩到 {max_length} 字符以内。
 请将下面的内容总结成一份不超过 {max_length} 字符的摘要，尽量保留关键信息、数据、结论与重要链接。{focus_section}
