@@ -7,7 +7,7 @@
 # 是否启用插件
 enabled = true
 # 配置版本（低于插件模型默认值时，Runner 会触发迁移并写回）
-config_version = "1.7.0"
+config_version = "1.8.0"
 # 是否让 fetch_url 始终对 Planner 可见（无需 tool_search 发现）。修改后需重新加载插件才能生效
 # always_visible_for_planner = false
 
@@ -95,11 +95,13 @@ api_key = ""
 
 [alt_text]
 # 每次抓取最多用 VLM 描述的图片数量；页面图片超过该值时优先描述最大的几张
-# （按 HEAD Content-Length 排序）。0 表示关闭 VLM 描述（保留 jina / 原始 alt）
-# max_images = 3
+# （按 HEAD Content-Length 排序）。0 表示关闭 VLM 描述（保留 jina / 原始 alt，
+# 并为每张图的 alt 追加 “You can call fetch_url again to obtain this image.”）
+# 默认 0，避免自动 VLM 拉长单次工具调用时间
+# max_images = 0
 # 参与 VLM 描述的图片最短边下限（像素），用于跳过图标 / Logo
 # min_dimension = 128
-# 生成图片描述使用的模型任务名（默认 Host 的 vlm 任务）
+# 生成图片描述的模型任务名（默认 Host 的 vlm 任务）
 # model = "vlm"
 # 生成图片描述的提示词
 # prompt = "请用中文详细描述这张图片的内容。请留意其主题、直观感受，输出为一段平文本，如果图中有文字，请把文字复述出来。如果一共超过了1024字，请进行概括总结。请注意不要分点，就输出一段最大1024字的文本"

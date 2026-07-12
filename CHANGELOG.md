@@ -5,6 +5,13 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.2.8] - 2026-07-12
+
+### 变更
+
+- `alt_text.max_images` 默认改为 `0`（关闭自动 VLM alt，缩短单次工具调用耗时；`config_version` 1.8.0）
+- 网页 Markdown 中每张图片的 alt 追加提示：`You can call fetch_url again to obtain this image.`
+
 ## [0.2.7] - 2026-07-11
 
 ### 修复

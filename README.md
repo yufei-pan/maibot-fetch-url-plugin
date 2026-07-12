@@ -47,7 +47,8 @@
 
 替换优先级：**VLM 描述 > jina 生成的 alt（需配置 `jina.api_key` 且开启 `with_generated_alt`）> 网页原始 alt**。
 
-- 页面图片多于 `max_images`（默认 3）时，按 HEAD `Content-Length` 排序优先描述**最大**的几张（跳过最短边小于 `min_dimension` 的图标 / Logo）
+- 页面图片多于 `max_images`（默认 **0**，即关闭）时，按 HEAD `Content-Length` 排序优先描述**最大**的几张（跳过最短边小于 `min_dimension` 的图标 / Logo）
+- 关闭 VLM 时仍保留 jina / 原始 alt，并为每张图的 alt 追加提示：`You can call fetch_url again to obtain this image.`（可再调 `fetch_url` 拉取原图）
 - 送入 VLM 前**始终**经体积估算单次压缩管道转码（由独立的 `[alt_text.image]` 配置，默认 WebP、目标 1 MB、最长边 2048 px）
 - 描述结果以图片内容 sha256 为键持久缓存在 `data/alt_text_cache.json`（LRU，默认 1024 条），重复抓取不再消耗 VLM 调用
 - VLM 任务未配置时自动跳过，保留 jina / 原始 alt
@@ -87,7 +88,7 @@
 | `content.max_content_length`             | 8192              | 单次返回文本上限（字符）                   |
 | `content.llm_summarize`                  | true              | 超长内容是否 LLM 总结                  |
 | `llm.model`                              | planner           | 总结用的模型**任务名**（非原始模型 ID）        |
-| `alt_text.max_images`                    | 3                 | 每次抓取最多 VLM 描述的图片数（0 关闭）        |
+| `alt_text.max_images`                    | 0                 | 每次抓取最多 VLM 描述的图片数（0 关闭，默认关闭） |
 | `alt_text.cache_size`                    | 1024              | 持久描述缓存条目上限                     |
 | `alt_text.image.convert_format`          | webp              | VLM 输入转码目标格式                     |
 | `alt_text.image.target_image_size`       | 1 MB              | 体积估算目标（始终走估算算法）                |

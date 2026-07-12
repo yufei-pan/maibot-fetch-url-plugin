@@ -157,11 +157,34 @@ def test_config_migration_alt_text_image_renames() -> None:
     assert alt_image["min_quality"] is None
     assert alt_image["animated_policy"] is None
     assert "max_image_size" not in alt_image
+    assert merged["alt_text"]["max_images"] is None
     assert notes
     eff = fetch_plugin.resolve_effective_fetch_url_config(fetch_plugin.FetchUrlConfig.model_validate(merged))
+    assert eff.alt_max_images == 0
     assert eff.alt_image_target_size == 1024 * 1024
     assert eff.alt_image_animated_policy == "keep_animated"
     print("ok: alt_text.image field renames and default bumps")
+
+
+def test_config_migration_max_images_default_off() -> None:
+    default_config = fetch_plugin.FetchUrlConfig().model_dump(mode="python")
+    legacy = {
+        "plugin": {"enabled": True, "config_version": "1.7.0", "always_visible_for_planner": False},
+        "alt_text": {"max_images": 3},
+    }
+    merged, changed, notes = fetch_plugin._normalize_fetch_url_config(legacy, default_config)
+    assert changed
+    assert merged["plugin"]["config_version"] == "1.8.0"
+    assert merged["alt_text"]["max_images"] is None
+    assert any("max_images" in note for note in notes)
+
+    custom = {
+        "plugin": {"enabled": True, "config_version": "1.7.0"},
+        "alt_text": {"max_images": 5},
+    }
+    merged_custom, _, _ = fetch_plugin._normalize_fetch_url_config(custom, default_config)
+    assert merged_custom["alt_text"]["max_images"] == 5
+    print("ok: max_images default 3->0 migration preserves custom values")
 
 
 def test_get_components_planner_visibility() -> None:
@@ -188,6 +211,7 @@ def test_resolve_effective_defaults() -> None:
     assert eff.jina_engine == "browser"
     assert eff.convert_format == "webp"
     assert eff.alt_image_target_size == 1024 * 1024
+    assert eff.alt_max_images == 0
     assert eff.fetch_cache_enabled is True
     assert eff.fetch_cache_ttl_seconds == 30 * 60
     assert eff.fetch_cache_max_entries == 128
@@ -412,7 +436,14 @@ def test_alt_text_regex_and_sanitize() -> None:
     assert matches[0].group("src") == "https://example.com/a.png"
     sanitized = fetch_plugin._sanitize_alt_text("第一行[测试]\n第二行(括号)")
     assert "[" not in sanitized and "]" not in sanitized and "\n" not in sanitized
-    print("ok: markdown image regex + alt sanitizer")
+
+    hinted = fetch_plugin._append_alt_fetch_hint(markdown)
+    assert fetch_plugin._ALT_FETCH_HINT in hinted
+    assert '![old alt' in hinted or "old alt" in hinted
+    assert hinted.count(fetch_plugin._ALT_FETCH_HINT) == 2
+    # 已含提示时不重复追加
+    assert fetch_plugin._append_alt_fetch_hint(hinted).count(fetch_plugin._ALT_FETCH_HINT) == 2
+    print("ok: markdown image regex + alt sanitizer + fetch hint")
 
 
 def test_alt_text_cache_persistence(tmp_dir: Path) -> None:
@@ -564,6 +595,7 @@ def main() -> None:
     test_pdf_to_markdown_blocking_blank_pdf()
     test_config_migration_from_1_2_0()
     test_config_migration_alt_text_image_renames()
+    test_config_migration_max_images_default_off()
     test_inbound_passthrough_acceptable_format()
     test_inbound_preprocess_oversized_dimension()
     test_inbound_preprocess_oversized_acceptable_format()

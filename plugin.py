@@ -5,7 +5,7 @@
 - 图片：下载后仅对不支持格式转码；可接受格式原样回传（体积压缩交由 image-recompress 等入站插件）
 - 支持抓取结果内存缓存（TTL）、JSON 友好展示、页面元信息；
 - 支持 start_char / end_char 分页窗口、超长内容 LLM 总结（注入人设）或截断；
-- 网页中的图片可由 VLM 生成描述并替换 alt 文本（优先级：VLM > jina 生成 alt > 原始 alt）。
+- 网页中的图片可由 VLM 生成描述并替换 alt 文本（优先级：VLM > jina 生成 alt > 原始 alt；默认关闭 VLM，alt 会提示可再调 fetch_url 取图）。
 """
 
 from __future__ import annotations
@@ -67,6 +67,9 @@ _SNIFF_MIN_BYTES = 16
 
 # Markdown 图片语法：![alt](src "title")
 _MD_IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]\n]*)\]\(\s*(?P<src>[^)\s]+)(?P<title>\s+\"[^\"]*\")?\s*\)")
+
+# 附加到网页内嵌图 alt 的提示，引导模型再次调用 fetch_url 拉取原图
+_ALT_FETCH_HINT = "You can call fetch_url again to obtain this image."
 
 # 直接抓取图片（入站 content_items）的质量搜索 / 尺寸缩放迭代上限
 _MAX_INBOUND_QUALITY_ITERATIONS = 6
@@ -160,6 +163,32 @@ def _sanitize_alt_text(text: str) -> str:
     sanitized = " ".join(str(text or "").split())
     sanitized = sanitized.replace("[", "［").replace("]", "］").replace("(", "（").replace(")", "）")
     return sanitized[:1024]
+
+
+def _compose_alt_with_fetch_hint(alt: str) -> str:
+    """清洗原 alt 并追加 ``_ALT_FETCH_HINT``（已含提示则不重复追加）。"""
+    hint = _ALT_FETCH_HINT
+    raw = str(alt or "")
+    if hint in raw:
+        return _sanitize_alt_text(raw)
+    base = _sanitize_alt_text(raw)
+    # 为 " " + hint 预留空间，避免 sanitize 截断把提示裁掉
+    max_base = 1024 - len(hint) - (1 if base else 0)
+    if max_base < 0:
+        return hint[:1024]
+    if len(base) > max_base:
+        base = base[:max_base].rstrip()
+    return f"{base} {hint}".strip() if base else hint
+
+
+def _append_alt_fetch_hint(markdown: str) -> str:
+    """为 Markdown 中每张图片的 alt 追加再次 fetch_url 的提示。"""
+
+    def replace(match: re.Match[str]) -> str:
+        title = match.group("title") or ""
+        return f"![{_compose_alt_with_fetch_hint(match.group('alt'))}]({match.group('src')}{title})"
+
+    return _MD_IMAGE_RE.sub(replace, markdown)
 
 
 def _looks_like_json(text: str) -> bool:
@@ -970,7 +999,7 @@ class FetchResultCache:
 # --------------------------------------------------------------------------- #
 
 # 与 PluginSectionConfig.config_version 默认值保持同步
-CURRENT_CONFIG_VERSION = "1.7.0"
+CURRENT_CONFIG_VERSION = "1.8.0"
 
 DEFAULT_FETCH_TIMEOUT = 15.0
 DEFAULT_FETCH_MAX_DOWNLOAD_SIZE = 64 * 1024 * 1024
@@ -986,7 +1015,7 @@ DEFAULT_CONTENT_MAX_LENGTH = 8192
 DEFAULT_LLM_MODEL = "planner"
 DEFAULT_LLM_TEMPERATURE = 0.3
 DEFAULT_LLM_MAX_TOKENS = 0
-DEFAULT_ALT_MAX_IMAGES = 3
+DEFAULT_ALT_MAX_IMAGES = 0
 DEFAULT_ALT_MIN_DIMENSION = 128
 DEFAULT_ALT_MODEL = "vlm"
 DEFAULT_ALT_CACHE_SIZE = 1024
@@ -998,6 +1027,7 @@ _LEGACY_DEFAULTS: dict[str, dict[str, Any]] = {
     "fetch.max_download_size": {"<1.5.0": 16 * 1024 * 1024},
     "image.max_image_size": {"<1.5.0": 2 * 1024 * 1024},
     "image.max_dimension": {"<1.5.0": 2048},
+    "alt_text.max_images": {"<1.8.0": 3},
     "alt_text.image.max_image_size": {"1.3.0": 512 * 1024},
     "alt_text.image.max_dimension": {"1.3.0": 1024, "1.4.0": 1024},
     "alt_text.image.animated_policy": {"1.3.0": "first_frame", "1.4.0": "first_frame"},
@@ -1234,6 +1264,13 @@ def _migrate_plugin_config_data(config: dict[str, Any], from_version: str) -> tu
     if _config_version_less_than(from_version, "1.6.0"):
         _, strip_changed, strip_notes = _strip_baked_defaults_to_placeholders(config)
         notes.extend(strip_notes)
+
+    if _config_version_less_than(from_version, "1.8.0"):
+        # 旧默认 3 → 占位 None（生效默认改为 0，关闭自动 VLM alt，缩短单次工具耗时）
+        current_max_images = _get_nested_config(config, "alt_text.max_images")
+        if current_max_images is not _CONFIG_MISSING and current_max_images == 3:
+            _set_nested_config(config, "alt_text.max_images", None)
+            notes.append("alt_text.max_images: 3 -> None（默认改为 0，关闭自动 VLM 描述）")
 
     plugin_section = config.get("plugin")
     if isinstance(plugin_section, dict):
@@ -1521,7 +1558,8 @@ class AltTextSectionConfig(PluginConfigBase):
         json_schema_extra={"placeholder": str(DEFAULT_ALT_MAX_IMAGES)},
         description=(
             "每次抓取最多用 VLM 描述的图片数量；页面图片超过该值时优先描述最大的几张"
-            "（按 HEAD Content-Length 排序）。0 表示关闭 VLM 描述（保留 jina / 原始 alt）。"
+            "（按 HEAD Content-Length 排序）。0 表示关闭 VLM 描述（保留 jina / 原始 alt，"
+            "并为每张图的 alt 追加再次 fetch_url 的提示；默认关闭以缩短单次工具耗时）。"
         ),
     )
     min_dimension: int | None = Field(
@@ -1847,11 +1885,11 @@ class FetchUrlPlugin(MaiBotPlugin):
         self._llm_temperature = 0.3
         self._llm_max_tokens = 0
         self._summarize_template = DEFAULT_SUMMARIZE_PROMPT_TEMPLATE
-        self._alt_max_images = 3
-        self._alt_min_dimension = 128
-        self._alt_model = "vlm"
+        self._alt_max_images = DEFAULT_ALT_MAX_IMAGES
+        self._alt_min_dimension = DEFAULT_ALT_MIN_DIMENSION
+        self._alt_model = DEFAULT_ALT_MODEL
         self._alt_prompt = DEFAULT_ALT_TEXT_PROMPT
-        self._alt_cache_size = 1024
+        self._alt_cache_size = DEFAULT_ALT_CACHE_SIZE
         self._alt_image_convert_format = "webp"
         self._alt_image_target_size = 1024 * 1024
         self._alt_image_max_dimension = 2048
@@ -2832,6 +2870,7 @@ class FetchUrlPlugin(MaiBotPlugin):
             summary = ""
             if use_summarize:
                 enhanced_window, described_count = await self._apply_vlm_alt_text(window, final_url)
+                enhanced_window = _append_alt_fetch_hint(enhanced_window)
                 summary = await self._summarize(enhanced_window, final_url, summary_focus)
             if summary:
                 processed = "summarized"
@@ -2847,6 +2886,7 @@ class FetchUrlPlugin(MaiBotPlugin):
                 body, described_count = await self._apply_vlm_alt_text(
                     window[: self._max_content_length], final_url
                 )
+                body = _append_alt_fetch_hint(body)
                 reason = "" if use_summarize is False else "（LLM 总结失败，已回退为截断）"
                 notice_lines[1] = f"文档总长 {total_chars} 字符；本次窗口 [{start}, {end})。"
                 notice_lines.append(
@@ -2855,6 +2895,7 @@ class FetchUrlPlugin(MaiBotPlugin):
                 )
         else:
             body, described_count = await self._apply_vlm_alt_text(window, final_url)
+            body = _append_alt_fetch_hint(body)
 
         if described_count:
             notice_lines.insert(2, f"已用视觉模型为 {described_count} 张图片生成描述并替换 alt 文本。")
