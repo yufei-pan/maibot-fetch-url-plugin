@@ -7,7 +7,7 @@
 # 是否启用插件
 enabled = true
 # 配置版本（低于插件模型默认值时，Runner 会触发迁移并写回）
-config_version = "1.8.0"
+config_version = "1.9.0"
 # 是否让 fetch_url 始终对 Planner 可见（无需 tool_search 发现）。修改后需重新加载插件才能生效
 # always_visible_for_planner = false
 
@@ -80,6 +80,9 @@ api_key = ""
 # 总结 LLM 调用的最大 token 数；0 表示自动按 max_content_length 的四倍计算
 # 若小于 max_content_length 会在日志中告警，输出可能被截断
 # max_tokens = 0
+# 本插件所有 llm.generate 的 cap.call RPC 超时（毫秒）；内容总结与 VLM 图片描述共用。
+# Host 未指定时默认仅 30 秒；留空则用插件默认 120000（120 秒）。
+# rpc_timeout_ms = 120000
 # 总结提示词模板。占位符：{nickname}、{personality}、{reply_style}、{url}、
 # {total}、{max_length}、{focus_section}、{content}
 # summarize_prompt_template = """你是网页抓取模块，是名为「{nickname}」的人工智能生命体的一部分。

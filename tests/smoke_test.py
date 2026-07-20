@@ -174,7 +174,7 @@ def test_config_migration_max_images_default_off() -> None:
     }
     merged, changed, notes = fetch_plugin._normalize_fetch_url_config(legacy, default_config)
     assert changed
-    assert merged["plugin"]["config_version"] == "1.8.0"
+    assert merged["plugin"]["config_version"] == "1.9.0"
     assert merged["alt_text"]["max_images"] is None
     assert any("max_images" in note for note in notes)
 
@@ -212,6 +212,7 @@ def test_resolve_effective_defaults() -> None:
     assert eff.convert_format == "webp"
     assert eff.alt_image_target_size == 1024 * 1024
     assert eff.alt_max_images == 0
+    assert eff.llm_rpc_timeout_ms == 120_000
     assert eff.fetch_cache_enabled is True
     assert eff.fetch_cache_ttl_seconds == 30 * 60
     assert eff.fetch_cache_max_entries == 128

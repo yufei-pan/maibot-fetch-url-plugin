@@ -88,6 +88,7 @@
 | `content.max_content_length`             | 8192              | 单次返回文本上限（字符）                   |
 | `content.llm_summarize`                  | true              | 超长内容是否 LLM 总结                  |
 | `llm.model`                              | planner           | 总结用的模型**任务名**（非原始模型 ID）        |
+| `llm.rpc_timeout_ms`                     | 120000            | 总结 / VLM `llm.generate` 的 cap.call RPC 超时（毫秒） |
 | `alt_text.max_images`                    | 0                 | 每次抓取最多 VLM 描述的图片数（0 关闭，默认关闭） |
 | `alt_text.cache_size`                    | 1024              | 持久描述缓存条目上限                     |
 | `alt_text.image.convert_format`          | webp              | VLM 输入转码目标格式                     |

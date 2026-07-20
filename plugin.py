@@ -999,7 +999,7 @@ class FetchResultCache:
 # --------------------------------------------------------------------------- #
 
 # 与 PluginSectionConfig.config_version 默认值保持同步
-CURRENT_CONFIG_VERSION = "1.8.0"
+CURRENT_CONFIG_VERSION = "1.9.0"
 
 DEFAULT_FETCH_TIMEOUT = 15.0
 DEFAULT_FETCH_MAX_DOWNLOAD_SIZE = 64 * 1024 * 1024
@@ -1015,6 +1015,7 @@ DEFAULT_CONTENT_MAX_LENGTH = 8192
 DEFAULT_LLM_MODEL = "planner"
 DEFAULT_LLM_TEMPERATURE = 0.3
 DEFAULT_LLM_MAX_TOKENS = 0
+DEFAULT_LLM_RPC_TIMEOUT_MS = 120_000  # llm.generate 的 cap.call RPC 超时（毫秒）；Host 默认仅 30s
 DEFAULT_ALT_MAX_IMAGES = 0
 DEFAULT_ALT_MIN_DIMENSION = 128
 DEFAULT_ALT_MODEL = "vlm"
@@ -1272,6 +1273,10 @@ def _migrate_plugin_config_data(config: dict[str, Any], from_version: str) -> tu
             _set_nested_config(config, "alt_text.max_images", None)
             notes.append("alt_text.max_images: 3 -> None（默认改为 0，关闭自动 VLM 描述）")
 
+    if _config_version_less_than(from_version, "1.9.0"):
+        # 新增可选 llm.rpc_timeout_ms；留空即跟随 120s 默认，无需迁移字段值
+        pass
+
     plugin_section = config.get("plugin")
     if isinstance(plugin_section, dict):
         plugin_section["config_version"] = CURRENT_CONFIG_VERSION
@@ -1488,6 +1493,14 @@ class LLMSectionConfig(PluginConfigBase):
         description=(
             "总结 LLM 调用的最大 token 数；0 表示自动按 max_content_length 的四倍计算。"
             "若小于 max_content_length 会在日志中告警，输出可能被截断。"
+        ),
+    )
+    rpc_timeout_ms: int | None = Field(
+        default=None,
+        json_schema_extra={"placeholder": str(DEFAULT_LLM_RPC_TIMEOUT_MS)},
+        description=(
+            "本插件所有 llm.generate 调用的 cap.call RPC 超时（毫秒）。"
+            "内容总结与 VLM 图片描述共用；留空默认 120000（120 秒）。Host 未指定时默认仅 30 秒。"
         ),
     )
     summarize_prompt_template: str = Field(
@@ -1725,6 +1738,7 @@ class EffectiveFetchUrlConfig:
     llm_model: str
     llm_temperature: float
     llm_max_tokens: int
+    llm_rpc_timeout_ms: int
     summarize_template: str
     alt_max_images: int
     alt_min_dimension: int
@@ -1819,6 +1833,7 @@ def resolve_effective_fetch_url_config(cfg: FetchUrlConfig) -> EffectiveFetchUrl
         llm_model=_effective_str(cfg.llm.model, DEFAULT_LLM_MODEL),
         llm_temperature=float(cfg.llm.temperature if cfg.llm.temperature is not None else DEFAULT_LLM_TEMPERATURE),
         llm_max_tokens=max(0, _effective_int(cfg.llm.max_tokens, DEFAULT_LLM_MAX_TOKENS)),
+        llm_rpc_timeout_ms=_effective_int(cfg.llm.rpc_timeout_ms, DEFAULT_LLM_RPC_TIMEOUT_MS, minimum=1),
         summarize_template=cfg.llm.summarize_prompt_template or DEFAULT_SUMMARIZE_PROMPT_TEMPLATE,
         alt_max_images=max(0, _effective_int(cfg.alt_text.max_images, DEFAULT_ALT_MAX_IMAGES)),
         alt_min_dimension=max(1, _effective_int(cfg.alt_text.min_dimension, DEFAULT_ALT_MIN_DIMENSION, minimum=1)),
@@ -1884,6 +1899,7 @@ class FetchUrlPlugin(MaiBotPlugin):
         self._llm_model = "planner"
         self._llm_temperature = 0.3
         self._llm_max_tokens = 0
+        self._llm_rpc_timeout_ms = DEFAULT_LLM_RPC_TIMEOUT_MS
         self._summarize_template = DEFAULT_SUMMARIZE_PROMPT_TEMPLATE
         self._alt_max_images = DEFAULT_ALT_MAX_IMAGES
         self._alt_min_dimension = DEFAULT_ALT_MIN_DIMENSION
@@ -2028,6 +2044,7 @@ class FetchUrlPlugin(MaiBotPlugin):
         self._llm_model = effective.llm_model
         self._llm_temperature = effective.llm_temperature
         self._llm_max_tokens = effective.llm_max_tokens
+        self._llm_rpc_timeout_ms = effective.llm_rpc_timeout_ms
         self._summarize_template = effective.summarize_template
 
         self._alt_max_images = effective.alt_max_images
@@ -2363,7 +2380,11 @@ class FetchUrlPlugin(MaiBotPlugin):
             }
         ]
         try:
-            result = await self.ctx.llm.generate(prompt=messages, model=self._alt_model)
+            result = await self.ctx.llm.generate(
+                prompt=messages,
+                model=self._alt_model,
+                timeout_ms=self._llm_rpc_timeout_ms,
+            )
         except Exception as exc:
             self.ctx.logger.warning("VLM 图片描述调用异常：%s", _format_exception(exc))
             return ""
@@ -2497,6 +2518,7 @@ class FetchUrlPlugin(MaiBotPlugin):
                 model=self._llm_model,
                 temperature=self._llm_temperature,
                 max_tokens=max_tokens,
+                timeout_ms=self._llm_rpc_timeout_ms,
             )
         except Exception as exc:
             self.ctx.logger.warning("LLM 总结调用异常：%s", _format_exception(exc))
