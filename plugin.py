@@ -2688,7 +2688,14 @@ class FetchUrlPlugin(MaiBotPlugin):
             cached = self._fetch_cache.get(cache_key)
             if cached is not None:
                 if cached["kind"] == "image":
-                    return await self._build_image_result(
+                    if return_image:
+                        return await self._build_image_result(
+                            url,
+                            cached["probe"],
+                            metadata=cached.get("metadata", {}),
+                            from_cache=True,
+                        )
+                    return await self._build_image_describe_result(
                         url,
                         cached["probe"],
                         metadata=cached.get("metadata", {}),
@@ -2717,7 +2724,9 @@ class FetchUrlPlugin(MaiBotPlugin):
                     cache_key,
                     {"kind": "image", "probe": probe, "metadata": metadata},
                 )
-                return await self._build_image_result(url, probe, metadata=metadata)
+                if return_image:
+                    return await self._build_image_result(url, probe, metadata=metadata)
+                return await self._build_image_describe_result(url, probe, metadata=metadata)
 
             markdown, provider, final_url, metadata = await self._fetch_text_content(client, url, probe)
 
@@ -2868,6 +2877,101 @@ class FetchUrlPlugin(MaiBotPlugin):
                     },
                 }
             ],
+        }
+
+    async def _build_image_describe_result(
+        self,
+        url: str,
+        probe: dict[str, Any],
+        *,
+        metadata: dict[str, str] | None = None,
+        from_cache: bool = False,
+    ) -> dict[str, Any]:
+        """API 图片默认路径：经 alt_text 管道 + VLM 生成文字描述；失败则 metadata_only。"""
+        page_metadata = dict(metadata or {})
+        page_metadata.setdefault("content_type", probe.get("content_type", "image/*"))
+        final_url = str(probe.get("final_url") or url)
+        data = probe["data"]
+        meta_lines = _format_metadata_notice_lines(
+            page_metadata,
+            requested_url=url,
+            final_url=final_url,
+            provider="image",
+            from_cache=from_cache,
+        )
+
+        width = height = None
+        fmt_hint = ""
+        try:
+            with Image.open(BytesIO(data)) as image:
+                image.load()
+                width, height = image.size
+                fmt_hint = _normalize_image_format(image.format or "")
+        except Exception:
+            width = height = None
+
+        description = ""
+        skip_reason = ""
+        if self._alt_cache is None:
+            skip_reason = "描述缓存未初始化"
+        elif not await self._check_vlm_available():
+            skip_reason = "VLM 模型不可用"
+        else:
+            cache_key = sha256(data).hexdigest()
+            cached = self._alt_cache.get(cache_key)
+            if cached:
+                description = cached
+            else:
+                payload = await asyncio.to_thread(
+                    _prepare_vlm_image_blocking,
+                    data,
+                    self._alt_min_dimension,
+                    convert_format=self._alt_image_convert_format,
+                    target_image_size=self._alt_image_target_size,
+                    max_dimension=self._alt_image_max_dimension,
+                    max_quality=self._alt_image_max_quality,
+                    min_quality=self._alt_image_min_quality,
+                    animated_policy=self._alt_image_animated_policy,
+                    max_animation_frames=self._alt_image_max_animation_frames,
+                )
+                if payload is None:
+                    skip_reason = "图片无法用于 VLM 描述（无效或尺寸过小）"
+                else:
+                    description = await self._describe_image_with_vlm(payload)
+                    if description:
+                        self._alt_cache.put(cache_key, description)
+                    else:
+                        skip_reason = "VLM 图片描述失败"
+
+        if description:
+            notice = "【fetch_url】\n" + "\n".join(meta_lines) + "\n已生成图片文字描述（未回传原始图片）。"
+            return {
+                "success": True,
+                "content": notice + "\n\n" + description,
+                "final_url": final_url,
+                "metadata": page_metadata,
+                "cached": from_cache,
+                "processed": "described",
+                "provider": "image",
+            }
+
+        dim_text = f"{width}x{height}" if width and height else "未知"
+        fmt_text = fmt_hint or "未知"
+        size_text = f"{len(data)} 字节"
+        notice_lines = [
+            "【fetch_url】",
+            *meta_lines,
+            f"格式 {fmt_text}，尺寸 {dim_text}，大小 {size_text}。",
+            f"未回传原始图片；文字描述未生成（{skip_reason or '未知原因'}）。",
+        ]
+        return {
+            "success": True,
+            "content": "\n".join(notice_lines),
+            "final_url": final_url,
+            "metadata": page_metadata,
+            "cached": from_cache,
+            "processed": "metadata_only",
+            "provider": "image",
         }
 
     async def _build_text_result(

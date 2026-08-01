@@ -600,11 +600,162 @@ def test_windowing_semantics() -> None:
     print("ok: windowing + on_exceed semantics (summarize/truncate/full/empty)")
 
 
+def test_api_image_describe_and_metadata_only() -> None:
+    """API 默认图片路径：VLM 成功 → described；VLM 失败 → metadata_only；无 content_items。"""
+
+    async def run() -> None:
+        instance = fetch_plugin.create_plugin()
+        instance.set_plugin_config(instance.build_default_config())
+        instance._refresh_config()
+        instance._alt_cache = fetch_plugin.AltTextCache(
+            Path("/tmp/fetch-url-api-alt-cache-test.json"),
+            max_entries=8,
+        )
+        png = _make_image_bytes("PNG", (128, 128))
+        probe = {
+            "kind": "image",
+            "data": png,
+            "final_url": "https://example.com/photo.png",
+            "content_type": "image/png",
+        }
+
+        async def fake_describe(_payload: dict) -> str:
+            return "一只红色方块图片"
+
+        async def vlm_ok() -> bool:
+            return True
+
+        async def vlm_no() -> bool:
+            return False
+
+        instance._check_vlm_available = vlm_ok  # type: ignore[method-assign]
+        instance._describe_image_with_vlm = fake_describe  # type: ignore[method-assign]
+
+        described = await instance._build_image_describe_result(
+            "https://example.com/photo.png",
+            probe,
+            metadata={"content_type": "image/png"},
+            from_cache=False,
+        )
+        assert described["success"] is True
+        assert described["processed"] == "described"
+        assert "一只红色方块图片" in described["content"]
+        assert "content_items" not in described
+
+        instance._check_vlm_available = vlm_no  # type: ignore[method-assign]
+
+        async def describe_fail(_payload: dict) -> str:
+            return ""
+
+        instance._describe_image_with_vlm = describe_fail  # type: ignore[method-assign]
+        # 清空缓存，避免命中上一次描述
+        instance._alt_cache = fetch_plugin.AltTextCache(
+            Path("/tmp/fetch-url-api-alt-cache-test-2.json"),
+            max_entries=8,
+        )
+        meta_only = await instance._build_image_describe_result(
+            "https://example.com/photo.png",
+            probe,
+            metadata={"content_type": "image/png"},
+            from_cache=False,
+        )
+        assert meta_only["success"] is True
+        assert meta_only["processed"] == "metadata_only"
+        assert "content_items" not in meta_only
+        assert "https://example.com/photo.png" in meta_only["content"]
+        assert "描述" in meta_only["content"] or "VLM" in meta_only["content"] or "跳过" in meta_only["content"]
+
+        bytes_result = await instance._build_image_result(
+            "https://example.com/photo.png",
+            probe,
+            metadata={"content_type": "image/png"},
+        )
+        assert "content_items" in bytes_result
+
+    asyncio.run(run())
+    print("ok: API image describe / metadata_only / bytes paths")
+
+
+def test_fetch_url_impl_respects_return_image_flag() -> None:
+    async def run() -> None:
+        instance = fetch_plugin.create_plugin()
+        instance.set_plugin_config(instance.build_default_config())
+        instance._refresh_config()
+        instance._fetch_cache_enabled = False
+        instance._alt_cache = fetch_plugin.AltTextCache(Path("/tmp/fetch-url-api-alt-cache-3.json"), 8)
+        png = _make_image_bytes("PNG", (96, 96))
+        probe = {
+            "kind": "image",
+            "data": png,
+            "final_url": "https://example.com/a.png",
+            "content_type": "image/png",
+            "url": "https://example.com/a.png",
+        }
+
+        async def fake_probe(_client, _url: str) -> dict:
+            return probe
+
+        calls: list[str] = []
+
+        async def fake_describe_result(*_a, **_k) -> dict:
+            calls.append("describe")
+            return {"success": True, "content": "desc", "processed": "described"}
+
+        async def fake_image_result(*_a, **_k) -> dict:
+            calls.append("bytes")
+            return {"success": True, "content": "img", "content_items": [{"content_type": "image"}]}
+
+        async def allow(_host: str) -> None:
+            return None
+
+        instance._assert_host_allowed = allow  # type: ignore[method-assign]
+        instance._probe_url = fake_probe  # type: ignore[method-assign]
+        instance._build_image_describe_result = fake_describe_result  # type: ignore[method-assign]
+        instance._build_image_result = fake_image_result  # type: ignore[method-assign]
+
+        class _DummyClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        instance._build_client = lambda: _DummyClient()  # type: ignore[method-assign]
+
+        out = await instance._fetch_url_impl(
+            url="https://example.com/a.png",
+            start_char=0,
+            end_char=-1,
+            on_exceed="summarize",
+            summary_focus="",
+            return_image=False,
+        )
+        assert calls == ["describe"]
+        assert out["processed"] == "described"
+
+        calls.clear()
+        out2 = await instance._fetch_url_impl(
+            url="https://example.com/a.png",
+            start_char=0,
+            end_char=-1,
+            on_exceed="summarize",
+            summary_focus="",
+            return_image=True,
+        )
+        assert calls == ["bytes"]
+        assert "content_items" in out2
+
+    asyncio.run(run())
+    print("ok: _fetch_url_impl return_image branch")
+
+
 def main() -> None:
     import tempfile
 
     test_get_components_planner_visibility()
     test_api_fetch_url_component_registered()
+    test_api_image_describe_and_metadata_only()
+    test_fetch_url_impl_respects_return_image_flag()
     test_plugin_importable()
     test_normalize_omits_none_for_toml_persist()
     test_webui_blank_optional_scalars_normalize()
