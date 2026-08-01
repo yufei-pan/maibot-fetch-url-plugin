@@ -52,7 +52,7 @@ Other plugins cannot reuse fetch-url’s SSRF checks, jina/local Markdown conver
 | Source | Patterns reused |
 |---|---|
 | SDK `@API` / `ctx.api.call` | `maibot-plugin-sdk/docs/guide.md` §API; `docs/zh/plugin/api-components.md` |
-| Napcat public APIs | Fully-qualified call name; handler return becomes Host `result` |
+| Napcat public APIs | Fully-qualified call name; handler return becomes Host `result`, then SDK `ctx.api.call` unwraps it |
 | Existing Tool | `FetchUrlPlugin.fetch_url` + `_fetch_url_impl` / `_build_image_result` / `_build_text_result` |
 | Alt-text / VLM | `_prepare_vlm_image_blocking`, `_describe_image_with_vlm`, `AltTextCache` |
 
@@ -109,7 +109,7 @@ async def api_fetch_url(
 **Caller example:**
 
 ```python
-response = await self.ctx.api.call(
+result = await self.ctx.api.call(
     "com.0-hz.fetch-url.fetch_url",
     url="https://example.com/page",
     start_char=0,
@@ -118,7 +118,7 @@ response = await self.ctx.api.call(
     summary_focus="",
     return_image=False,
 )
-# Host wrapper: response["success"] and response["result"] hold the Tool-shaped dict
+# SDK unwraps the Host {success, result}; result is the Tool-shaped handler dict
 ```
 
 ### Parameters
@@ -142,9 +142,11 @@ Matches Tool:
 
 **Success image describe (`return_image=False`):** `success`, `content` (VLM description or metadata-only notice), `final_url`, `metadata`, `cached`, `processed` in `{described, metadata_only}` — **no** `content_items`
 
-**Failure:** `{success: False, content: "抓取失败：…"}` (same soft style as Tool)
+**Fetch soft failure:** `{success: False, content: "抓取失败：…"}` (same soft style as Tool)
 
-Host additionally wraps the handler return: callers typically see `{success: True, result: <handler dict>}`.
+Host wraps a successful handler return as `{success: True, result: <handler dict>}`, but SDK `ctx.api.call`
+unwraps `result`; callers receive the handler dict directly. A Host-level failure may instead remain
+`{success: False, error: ...}` and has no `content`.
 
 ---
 

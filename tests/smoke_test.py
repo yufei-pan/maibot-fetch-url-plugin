@@ -220,6 +220,28 @@ def test_api_fetch_url_component_registered() -> None:
     print("ok: API fetch_url registered public=True")
 
 
+def test_fetch_url_entries_wire_image_defaults() -> None:
+    async def run() -> None:
+        instance = fetch_plugin.create_plugin()
+        calls: list[dict] = []
+
+        async def fake_fetch_url_impl(**kwargs) -> dict:
+            calls.append(kwargs)
+            return {"success": True, "content": "stub"}
+
+        instance._fetch_url_impl = fake_fetch_url_impl  # type: ignore[method-assign]
+
+        tool_result = await instance.fetch_url(url="https://example.com/tool.png")
+        api_result = await instance.api_fetch_url(url="https://example.com/api.png")
+
+        assert tool_result["success"] is True
+        assert api_result["success"] is True
+        assert [call["return_image"] for call in calls] == [True, False]
+
+    asyncio.run(run())
+    print("ok: Tool/API image return defaults wired to true/false")
+
+
 def test_resolve_effective_defaults() -> None:
     """占位空值应解析为代码内置默认。"""
     cfg = fetch_plugin.FetchUrlConfig()
@@ -754,6 +776,7 @@ def main() -> None:
 
     test_get_components_planner_visibility()
     test_api_fetch_url_component_registered()
+    test_fetch_url_entries_wire_image_defaults()
     test_api_image_describe_and_metadata_only()
     test_fetch_url_impl_respects_return_image_flag()
     test_plugin_importable()

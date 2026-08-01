@@ -1,6 +1,6 @@
 """网页抓取 (Fetch URL) 插件。
 
-提供单一 ``fetch_url`` 工具：
+提供 ``fetch_url`` 工具：
 - 网页 / PDF：优先通过 jina.ai Reader 转 Markdown，失败时回退到本地抓取 + markdownify / pypdf；
 - 图片：下载后仅对不支持格式转码；可接受格式原样回传（体积压缩交由 image-recompress 等入站插件）
 - 支持抓取结果内存缓存（TTL）、JSON 友好展示、页面元信息；

@@ -133,7 +133,7 @@ fetch_url(url, start_char=0, end_char=-1, on_exceed="summarize", summary_focus="
 本插件暴露公开 API `fetch_url`（完整名：`com.0-hz.fetch-url.fetch_url`）。
 
 ```python
-response = await self.ctx.api.call(
+result = await self.ctx.api.call(
     "com.0-hz.fetch-url.fetch_url",
     url="https://example.com/page",
     start_char=0,
@@ -142,8 +142,7 @@ response = await self.ctx.api.call(
     summary_focus="",
     return_image=False,
 )
-# Host 包装：业务结果在 response["result"]（当 response["success"] 为真）
-result = response["result"]
+# SDK 已解包 Host 的 {success, result}，result 即 API 处理函数返回的字典
 ```
 
 参数与工具大体一致，额外：
@@ -152,7 +151,13 @@ result = response["result"]
 |------|------|------|
 | `return_image` | `false` | 仅 API。`false`：图片走 VLM/alt_text 文字描述（失败则 metadata-only）；`true`：与工具相同，经 `content_items` 回传图片字节 |
 
-API **不会**向 Maisaka 上下文追加内容；调用方只使用返回值。`result` 形如工具返回：`{success, content, ...}`。
+API **不会**向 Maisaka 上下文追加内容；调用方只使用返回值。SDK 成功调用时直接返回处理函数字典，形如
+`{success, content, ...}`，无需再读取 `result["result"]`。失败有两种形态：
+
+- Host 级调用失败可能返回 `{success: False, error: ...}`，不含 `content`；
+- 抓取处理函数的软失败返回 `{success: False, content: "抓取失败：…"}`。
+
+API 对单张图片的文字描述会调用 VLM，不受 `alt_text.max_images` 限制；该配置只控制网页内嵌图片的 alt 文本替换数量。
 
 ## 测试
 
