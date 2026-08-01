@@ -5,6 +5,13 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0] - 2026-08-01
+
+### 新增
+
+- 公开 `@API fetch_url`（`com.0-hz.fetch-url.fetch_url`）：参数对齐工具，供其他插件调用
+- API 图片默认 `return_image=false`：经 alt_text/VLM 返回文字描述；VLM 不可用或失败时返回 metadata-only；`return_image=true` 时与工具相同回传图片
+
 ## [0.2.9] - 2026-07-20
 
 ### 新增

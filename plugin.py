@@ -6,6 +6,7 @@
 - 支持抓取结果内存缓存（TTL）、JSON 友好展示、页面元信息；
 - 支持 start_char / end_char 分页窗口、超长内容 LLM 总结（注入人设）或截断；
 - 网页中的图片可由 VLM 生成描述并替换 alt 文本（优先级：VLM > jina 生成 alt > 原始 alt；默认关闭 VLM，alt 会提示可再调 fetch_url 取图）。
+- 同时暴露公开 API ``fetch_url`` 供其他插件调用；图片默认返回 VLM/alt_text 文字描述（``return_image=true`` 时与工具相同回传图片）。
 """
 
 from __future__ import annotations

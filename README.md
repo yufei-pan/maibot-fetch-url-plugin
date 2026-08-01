@@ -128,6 +128,32 @@ fetch_url(url, start_char=0, end_char=-1, on_exceed="summarize", summary_focus="
 - 定向总结：`fetch_url(url=..., summary_focus="价格和发布时间")`
 - 抓图片：`fetch_url(url="https://example.com/photo.png")` → 图片直接出现在上下文中
 
+## 插件间 API（其他插件调用）
+
+本插件暴露公开 API `fetch_url`（完整名：`com.0-hz.fetch-url.fetch_url`）。
+
+```python
+response = await self.ctx.api.call(
+    "com.0-hz.fetch-url.fetch_url",
+    url="https://example.com/page",
+    start_char=0,
+    end_char=-1,
+    on_exceed="summarize",
+    summary_focus="",
+    return_image=False,
+)
+# Host 包装：业务结果在 response["result"]（当 response["success"] 为真）
+result = response["result"]
+```
+
+参数与工具大体一致，额外：
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `return_image` | `false` | 仅 API。`false`：图片走 VLM/alt_text 文字描述（失败则 metadata-only）；`true`：与工具相同，经 `content_items` 回传图片字节 |
+
+API **不会**向 Maisaka 上下文追加内容；调用方只使用返回值。`result` 形如工具返回：`{success, content, ...}`。
+
 ## 测试
 
 ```bash
