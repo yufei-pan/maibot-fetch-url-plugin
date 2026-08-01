@@ -9,3 +9,4 @@ __pycache__/
 
 # 本地配置（可能含 Cookie / API Key）
 config.local.toml
+.worktrees/
