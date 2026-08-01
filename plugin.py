@@ -33,7 +33,7 @@ from bs4 import BeautifulSoup
 from markdownify import markdownify as html_to_markdown
 from PIL import Image, ImageOps, ImageSequence
 
-from maibot_sdk import Field, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk import API, Field, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.config import (
     extract_plugin_config_version,
     merge_plugin_config_data,
@@ -2531,6 +2531,39 @@ class FetchUrlPlugin(MaiBotPlugin):
     # ------------------------------------------------------------------ #
     # fetch_url 工具
     # ------------------------------------------------------------------ #
+    async def _invoke_fetch_url(
+        self,
+        *,
+        url: str,
+        start_char: int,
+        end_char: int,
+        on_exceed: str,
+        summary_focus: str,
+        return_image: bool,
+    ) -> dict[str, Any]:
+        """Tool / API 共用入口：执行抓取并把异常转成 Tool 形返回。"""
+        try:
+            return await self._fetch_url_impl(
+                url=str(url or "").strip(),
+                start_char=_safe_int(start_char, 0),
+                end_char=_safe_int(end_char, -1),
+                on_exceed=str(on_exceed or "summarize").strip().lower(),
+                summary_focus=str(summary_focus or ""),
+                return_image=bool(return_image),
+            )
+        except FetchUrlError as exc:
+            return {"success": False, "content": f"抓取失败：{exc}"}
+        except httpx.HTTPStatusError as exc:
+            return {
+                "success": False,
+                "content": f"抓取失败：目标服务器返回 HTTP {exc.response.status_code}（{url}）",
+            }
+        except httpx.TimeoutException:
+            return {"success": False, "content": f"抓取失败：请求超时（{url}）"}
+        except Exception as exc:
+            self.ctx.logger.error("fetch_url 执行异常：url=%s, error=%s", url, _format_exception(exc))
+            return {"success": False, "content": f"抓取失败：{_format_exception(exc)}"}
+
     @Tool(
         "fetch_url",
         brief_description="抓取任意 URL：网页/PDF 转为 Markdown 文本返回，图片直接以图像形式返回，支持分页读取与超长内容自动总结。",
@@ -2595,26 +2628,40 @@ class FetchUrlPlugin(MaiBotPlugin):
         **kwargs: Any,
     ) -> dict[str, Any]:
         del kwargs
-        try:
-            return await self._fetch_url_impl(
-                url=str(url or "").strip(),
-                start_char=_safe_int(start_char, 0),
-                end_char=_safe_int(end_char, -1),
-                on_exceed=str(on_exceed or "summarize").strip().lower(),
-                summary_focus=str(summary_focus or ""),
-            )
-        except FetchUrlError as exc:
-            return {"success": False, "content": f"抓取失败：{exc}"}
-        except httpx.HTTPStatusError as exc:
-            return {
-                "success": False,
-                "content": f"抓取失败：目标服务器返回 HTTP {exc.response.status_code}（{url}）",
-            }
-        except httpx.TimeoutException:
-            return {"success": False, "content": f"抓取失败：请求超时（{url}）"}
-        except Exception as exc:
-            self.ctx.logger.error("fetch_url 执行异常：url=%s, error=%s", url, _format_exception(exc))
-            return {"success": False, "content": f"抓取失败：{_format_exception(exc)}"}
+        return await self._invoke_fetch_url(
+            url=url,
+            start_char=start_char,
+            end_char=end_char,
+            on_exceed=on_exceed,
+            summary_focus=summary_focus,
+            return_image=True,
+        )
+
+    @API(
+        "fetch_url",
+        description="抓取 URL 并返回内容（供其他插件调用；图片默认返回文字描述）",
+        version="1",
+        public=True,
+    )
+    async def api_fetch_url(
+        self,
+        url: str = "",
+        start_char: int = 0,
+        end_char: int = -1,
+        on_exceed: str = "summarize",
+        summary_focus: str = "",
+        return_image: bool = False,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del kwargs
+        return await self._invoke_fetch_url(
+            url=url,
+            start_char=start_char,
+            end_char=end_char,
+            on_exceed=on_exceed,
+            summary_focus=summary_focus,
+            return_image=return_image,
+        )
 
     async def _fetch_url_impl(
         self,
@@ -2624,6 +2671,7 @@ class FetchUrlPlugin(MaiBotPlugin):
         end_char: int,
         on_exceed: str,
         summary_focus: str,
+        return_image: bool = True,
     ) -> dict[str, Any]:
         """fetch_url 的主流程。"""
         if not url:

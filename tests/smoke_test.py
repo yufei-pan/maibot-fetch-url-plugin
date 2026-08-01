@@ -190,16 +190,34 @@ def test_config_migration_max_images_default_off() -> None:
 def test_get_components_planner_visibility() -> None:
     instance = fetch_plugin.create_plugin()
     components_off = instance.get_components()
-    fetch_off = next(item for item in components_off if item["name"] == "fetch_url")
+    fetch_off = next(
+        item for item in components_off if item["name"] == "fetch_url" and item["type"] == "TOOL"
+    )
     assert not fetch_off["metadata"].get("core_tool")
     assert fetch_off["metadata"].get("visibility") != "visible"
 
     instance._always_visible_for_planner = True
     components_on = instance.get_components()
-    fetch_on = next(item for item in components_on if item["name"] == "fetch_url")
+    fetch_on = next(
+        item for item in components_on if item["name"] == "fetch_url" and item["type"] == "TOOL"
+    )
     assert fetch_on["metadata"].get("core_tool") is True
     assert fetch_on["metadata"].get("visibility") == "visible"
     print("ok: get_components planner visibility toggle")
+
+
+def test_api_fetch_url_component_registered() -> None:
+    instance = fetch_plugin.create_plugin()
+    components = instance.get_components()
+    api = next(
+        (item for item in components if item["name"] == "fetch_url" and item["type"] == "API"),
+        None,
+    )
+    assert api is not None, "缺少公开 API 组件 fetch_url"
+    assert api["metadata"].get("public") is True
+    assert api["metadata"].get("version") == "1"
+    assert api["metadata"].get("handler_name") == "api_fetch_url"
+    print("ok: API fetch_url registered public=True")
 
 
 def test_resolve_effective_defaults() -> None:
@@ -586,6 +604,7 @@ def main() -> None:
     import tempfile
 
     test_get_components_planner_visibility()
+    test_api_fetch_url_component_registered()
     test_plugin_importable()
     test_normalize_omits_none_for_toml_persist()
     test_webui_blank_optional_scalars_normalize()
