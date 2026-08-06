@@ -9,16 +9,17 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-import tomllib
 from io import BytesIO
 from pathlib import Path
+
+import tomllib
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN_DIR))
 
-from PIL import Image  # noqa: E402
+from PIL import Image
 
-import plugin as fetch_plugin  # noqa: E402
+import plugin as fetch_plugin
 
 _INBOUND = dict(
     acceptable_formats={"jpeg", "png", "gif", "webp"},
@@ -218,6 +219,37 @@ def test_api_fetch_url_component_registered() -> None:
     assert api["metadata"].get("version") == "1"
     assert api["metadata"].get("handler_name") == "api_fetch_url"
     print("ok: API fetch_url registered public=True")
+
+
+def test_lrs_procedure_provider_apis_registered() -> None:
+    instance = fetch_plugin.create_plugin()
+    components = instance.get_components()
+    describe = next(
+        (item for item in components if item["name"] == "describe_procedures" and item["type"] == "API"),
+        None,
+    )
+    invoke = next(
+        (item for item in components if item["name"] == "invoke_procedure" and item["type"] == "API"),
+        None,
+    )
+    assert describe is not None, "缺少 LRS describe_procedures API"
+    assert invoke is not None, "缺少 LRS invoke_procedure API"
+    assert describe["metadata"].get("public") is True
+    assert describe["metadata"].get("version") == "1"
+    assert describe["metadata"].get("lunagentic_extension") == "procedures"
+    assert describe["metadata"].get("lunagentic_contract") == "1"
+    assert invoke["metadata"].get("public") is True
+    assert invoke["metadata"].get("version") == "1"
+
+    async def run() -> None:
+        envelope = await instance.describe_procedures()
+        assert envelope["contract_version"] == "1"
+        assert envelope["procedures"][0]["procedure_id"] == "fetch_url.fetch"
+        props = envelope["procedures"][0]["arguments_schema"]["properties"]
+        assert "return_image" not in props
+
+    asyncio.run(run())
+    print("ok: LRS procedure provider APIs registered")
 
 
 def test_fetch_url_entries_wire_image_defaults() -> None:
@@ -776,6 +808,7 @@ def main() -> None:
 
     test_get_components_planner_visibility()
     test_api_fetch_url_component_registered()
+    test_lrs_procedure_provider_apis_registered()
     test_fetch_url_entries_wire_image_defaults()
     test_api_image_describe_and_metadata_only()
     test_fetch_url_impl_respects_return_image_flag()

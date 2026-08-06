@@ -7,6 +7,7 @@
 - 支持 start_char / end_char 分页窗口、超长内容 LLM 总结（注入人设）或截断；
 - 网页中的图片可由 VLM 生成描述并替换 alt 文本（优先级：VLM > jina 生成 alt > 原始 alt；默认关闭 VLM，alt 会提示可再调 fetch_url 取图）。
 - 同时暴露公开 API ``fetch_url`` 供其他插件调用；图片默认返回 VLM/alt_text 文字描述（``return_image=true`` 时与工具相同回传图片）。
+- 可选暴露 LRS ``describe_procedures@1`` / ``invoke_procedure@1``（``fetch_url.fetch``）。
 """
 
 from __future__ import annotations
@@ -19,21 +20,18 @@ import re
 import time
 from base64 import b64encode
 from collections import OrderedDict
+from collections.abc import Mapping
+from copy import deepcopy
+from dataclasses import dataclass
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
-from collections.abc import Mapping
-from dataclasses import dataclass
 from types import UnionType
-from typing import Any, Union, get_args, get_origin
-
+from typing import Any, Literal, Union, get_args, get_origin
 from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
-from markdownify import markdownify as html_to_markdown
-from PIL import Image, ImageOps, ImageSequence
-
 from maibot_sdk import API, Field, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.config import (
     extract_plugin_config_version,
@@ -42,6 +40,10 @@ from maibot_sdk.config import (
     validate_plugin_config,
 )
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
+from markdownify import markdownify as html_to_markdown
+from PIL import Image, ImageOps, ImageSequence
+from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import Field as PydanticField
 
 # --------------------------------------------------------------------------- #
 # 常量
@@ -1861,6 +1863,140 @@ def resolve_effective_fetch_url_config(cfg: FetchUrlConfig) -> EffectiveFetchUrl
 
 
 # --------------------------------------------------------------------------- #
+# LRS Procedure provider（可选集成）
+# --------------------------------------------------------------------------- #
+
+FETCH_PROCEDURE_ID = "fetch_url.fetch"
+FETCH_PROVIDER_PLUGIN_ID = "com.0-hz.fetch-url"
+
+FETCH_PROCEDURE_DEFINITION: dict[str, Any] = {
+    "procedure_id": FETCH_PROCEDURE_ID,
+    "version": "1",
+    "display_name": "抓取网页全文",
+    "description": (
+        "抓取 http/https URL；网页和 PDF 返回 Markdown，图片返回文字描述。"
+        "支持字符窗口、超长内容总结或截断。"
+    ),
+    "arguments_schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "url": {"type": "string", "minLength": 1, "maxLength": 8192},
+            "start_char": {"type": "integer", "minimum": 0, "default": 0},
+            "end_char": {"type": "integer", "minimum": -1, "default": -1},
+            "on_exceed": {
+                "type": "string",
+                "enum": ["summarize", "truncate"],
+                "default": "summarize",
+            },
+            "summary_focus": {"type": "string", "maxLength": 2000, "default": ""},
+        },
+        "required": ["url"],
+    },
+    "result_schema": {"type": "object"},
+    "idempotent": True,
+    "timeout_seconds": 120,
+    "external_cost_kind": "provider_metered",
+    "enabled": True,
+}
+
+
+class FetchProcedureArguments(BaseModel):
+    """LRS invoke_procedure 严格参数（禁止额外字段）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = PydanticField(min_length=1, max_length=8192)
+    start_char: int = PydanticField(default=0, ge=0)
+    end_char: int = PydanticField(default=-1, ge=-1)
+    on_exceed: Literal["summarize", "truncate"] = "summarize"
+    summary_focus: str = PydanticField(default="", max_length=2000)
+
+
+def _procedure_error(
+    code: str,
+    message: str,
+    started: float,
+    details: Any = None,
+) -> dict[str, Any]:
+    error: dict[str, Any] = {"code": code, "message": message}
+    if details is not None:
+        error["details"] = details
+    return {
+        "success": False,
+        "data": None,
+        "error": error,
+        "research_credits_charged": 0.0,
+        "metadata": {
+            "provider_plugin_id": FETCH_PROVIDER_PLUGIN_ID,
+            "duration_ms": max(0, int((time.monotonic() - started) * 1000)),
+            "provenance": [],
+            "external_cost": None,
+        },
+    }
+
+
+def _normalize_lrs_procedure_result(
+    request_id: str,
+    requested_url: str,
+    result: Mapping[str, Any],
+    started: float,
+) -> dict[str, Any]:
+    """把现有 Tool/API 形结果包装为 LRS ProcedureResult（不含 binary）。"""
+
+    del request_id  # 保留签名供调用方传入；不把 scoped/request 机密写入结果
+    duration_ms = max(0, int((time.monotonic() - started) * 1000))
+    if not result.get("success"):
+        message = str(result.get("content") or "抓取失败")
+        return {
+            "success": False,
+            "data": None,
+            "error": {"code": "fetch_failed", "message": message},
+            "research_credits_charged": 0.0,
+            "metadata": {
+                "provider_plugin_id": FETCH_PROVIDER_PLUGIN_ID,
+                "duration_ms": duration_ms,
+                "provenance": [],
+                "external_cost": None,
+            },
+        }
+
+    data_keys = (
+        "content",
+        "final_url",
+        "provider",
+        "processed",
+        "total_chars",
+        "returned_range",
+        "metadata",
+        "cached",
+    )
+    data = {key: result[key] for key in data_keys if key in result}
+    final_url = str(result.get("final_url") or requested_url)
+    provenance = [
+        {
+            "url": final_url,
+            "requested_url": requested_url,
+            "provider": result.get("provider"),
+            "cached": bool(result.get("cached", False)),
+            "processed": result.get("processed"),
+        }
+    ]
+    return {
+        "success": True,
+        "data": data,
+        "error": None,
+        "research_credits_charged": 0.0,
+        "metadata": {
+            "provider_plugin_id": FETCH_PROVIDER_PLUGIN_ID,
+            "duration_ms": duration_ms,
+            "provenance": provenance,
+            "external_cost": None,
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
 # 插件主体
 # --------------------------------------------------------------------------- #
 
@@ -2663,6 +2799,60 @@ class FetchUrlPlugin(MaiBotPlugin):
             summary_focus=summary_focus,
             return_image=return_image,
         )
+
+    @API(
+        "describe_procedures",
+        description="列出 Fetch URL 提供给 Lunagentic Research Swarm 的 Procedure",
+        version="1",
+        public=True,
+        lunagentic_extension="procedures",
+        lunagentic_contract="1",
+    )
+    async def describe_procedures(self) -> dict[str, Any]:
+        return {
+            "contract_version": "1",
+            "procedures": [deepcopy(FETCH_PROCEDURE_DEFINITION)],
+        }
+
+    @API(
+        "invoke_procedure",
+        description="按 LRS Procedure contract 调用 Fetch URL",
+        version="1",
+        public=True,
+    )
+    async def invoke_procedure(
+        self,
+        procedure_id: str,
+        request_id: str,
+        arguments: dict[str, Any],
+        scoped_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        del scoped_metadata
+        started = time.monotonic()
+        if procedure_id != FETCH_PROCEDURE_ID:
+            return _procedure_error(
+                "procedure_unavailable",
+                f"未知 Procedure：{procedure_id}",
+                started,
+            )
+        try:
+            parsed = FetchProcedureArguments.model_validate(arguments or {})
+        except ValidationError as exc:
+            return _procedure_error(
+                "invalid_arguments",
+                "Fetch URL Procedure 参数无效",
+                started,
+                exc.errors(),
+            )
+        result = await self._invoke_fetch_url(
+            url=parsed.url,
+            start_char=parsed.start_char,
+            end_char=parsed.end_char,
+            on_exceed=parsed.on_exceed,
+            summary_focus=parsed.summary_focus,
+            return_image=False,
+        )
+        return _normalize_lrs_procedure_result(request_id, parsed.url, result, started)
 
     async def _fetch_url_impl(
         self,

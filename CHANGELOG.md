@@ -5,6 +5,18 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0] - 2026-08-06
+
+### 新增
+
+- 可选 LRS Procedure provider：公开 `@API describe_procedures@1`（`lunagentic_extension=procedures`）与 `@API invoke_procedure@1`
+- Procedure ID `fetch_url.fetch`：复用现有抓取管线；LRS 调用固定 `return_image=false`（只返回文字描述，不回传图片 binary）
+- 提供方配置、Jina/VLM 密钥仍完全由本插件管理；不把 LRS 写成硬依赖
+
+### 保持
+
+- 原有 `@Tool fetch_url` 与公开 `@API fetch_url@1` 行为与参数兼容
+
 ## [0.3.0] - 2026-08-01
 
 ### 新增

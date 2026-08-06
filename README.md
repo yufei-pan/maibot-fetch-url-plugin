@@ -159,6 +159,17 @@ API **不会**向 Maisaka 上下文追加内容；调用方只使用返回值。
 
 API 对单张图片的文字描述会调用 VLM，不受 `alt_text.max_images` 限制；该配置只控制网页内嵌图片的 alt 文本替换数量。
 
+## Lunagentic Research Swarm（可选集成）
+
+本插件是 [麦麦深度调查组（LRS）](https://github.com/yufei-pan/maibot-lunagentic-research-swarm) 的**推荐**网页全文抓取 Procedure 提供方，**不是**硬依赖：
+
+- 同时安装并启用两个插件后，LRS 会扫描带 `lunagentic_extension=procedures` 的公开 API，自动发现本插件的 `describe_procedures@1` / `invoke_procedure@1`。
+- **不需要**在 LRS 配置中复制 Jina key、Cookie、代理等；密钥与抓取策略仍完全由本插件 `config.toml` 管理。
+- Procedure ID：`fetch_url.fetch`。参数与工具对齐：`url`（必填）、`start_char` / `end_char`、`on_exceed`（`summarize`|`truncate`）、`summary_focus`。
+- LRS 调用固定 `return_image=false`：图片只返回文字描述/元数据，不把 base64 图片塞进 Procedure payload；普通 MaiBot `fetch_url` Tool 仍可按原样回传图片。
+- 结果带 provenance metadata（请求 URL / 最终 URL / provider / cached），**不**承诺对网页内容真实性背书。
+- 卸载或禁用本插件后，LRS 本身继续运行；对新调用返回结构化 `procedure_unavailable`，`/swarm health` 可显示缺少推荐集成。
+
 ## 测试
 
 ```bash
