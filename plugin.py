@@ -20,7 +20,7 @@ import re
 import time
 from base64 import b64encode
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from hashlib import sha256
@@ -137,6 +137,26 @@ def _render(template: str, **values: Any) -> str:
     for key, value in values.items():
         rendered = rendered.replace("{" + key + "}", str(value))
     return rendered
+
+
+def resolve_llm_route(
+    configured: str,
+    available_tasks: Sequence[str] | None,
+) -> tuple[str | None, str | None]:
+    """把配置值拆成 Host 的 ``task_name`` / ``model_name``。
+
+    命中 ``llm.get_available_models()`` 任务名则走 ``task_name``；否则走 ``model_name``。
+    列表不可用时按任务名，避免 SDK 2.8.1 把 ``utils``/``replyer`` 当成具体模型。
+    """
+    name = str(configured or "").strip()
+    if not name:
+        return None, None
+    tasks = {str(item).strip() for item in (available_tasks or []) if str(item).strip()}
+    if not tasks:
+        return name, None
+    if name in tasks:
+        return name, None
+    return None, name
 
 
 def _format_exception(exc: BaseException) -> str:
@@ -2057,6 +2077,23 @@ class FetchUrlPlugin(MaiBotPlugin):
         self._fetch_cache_max_entries = DEFAULT_FETCH_CACHE_MAX_ENTRIES
         self._config_initialized = False
 
+    async def _llm_generate(self, prompt: Any, configured: str, **extra: Any) -> dict[str, Any]:
+        """按配置调用 Host LLM：任务名走 ``task_name``，否则 ``model_name``。"""
+        available: list[str] | None
+        try:
+            raw = await self.ctx.llm.get_available_models()
+            available = list(raw) if raw else []
+        except Exception as exc:
+            self.ctx.logger.warning("获取 Host 模型任务列表失败，按任务名调用: %s", exc)
+            available = None
+        task_name, model_name = resolve_llm_route(configured, available)
+        kwargs: dict[str, Any] = {"prompt": prompt, **extra}
+        if task_name:
+            kwargs["task_name"] = task_name
+        if model_name:
+            kwargs["model_name"] = model_name
+        return await self.ctx.llm.generate(**kwargs)
+
     # ------------------------------------------------------------------ #
     # 生命周期
     # ------------------------------------------------------------------ #
@@ -2517,9 +2554,9 @@ class FetchUrlPlugin(MaiBotPlugin):
             }
         ]
         try:
-            result = await self.ctx.llm.generate(
-                prompt=messages,
-                model=self._alt_model,
+            result = await self._llm_generate(
+                messages,
+                self._alt_model,
                 timeout_ms=self._llm_rpc_timeout_ms,
             )
         except Exception as exc:
@@ -2650,9 +2687,9 @@ class FetchUrlPlugin(MaiBotPlugin):
         )
         max_tokens = self._resolve_summarize_max_tokens()
         try:
-            result = await self.ctx.llm.generate(
-                prompt=prompt,
-                model=self._llm_model,
+            result = await self._llm_generate(
+                prompt,
+                self._llm_model,
                 temperature=self._llm_temperature,
                 max_tokens=max_tokens,
                 timeout_ms=self._llm_rpc_timeout_ms,

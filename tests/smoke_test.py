@@ -803,6 +803,82 @@ def test_fetch_url_impl_respects_return_image_flag() -> None:
     print("ok: _fetch_url_impl return_image branch")
 
 
+def test_resolve_llm_route_prefers_task_names() -> None:
+    assert fetch_plugin.resolve_llm_route("utils", ["utils", "planner", "replyer"]) == ("utils", None)
+    assert fetch_plugin.resolve_llm_route("planner", ["utils", "planner"]) == ("planner", None)
+    print("ok: Host task names route to task_name")
+
+
+def test_resolve_llm_route_uses_model_name_when_not_a_task() -> None:
+    assert fetch_plugin.resolve_llm_route("step-5-preview", ["utils", "planner"]) == (None, "step-5-preview")
+    print("ok: concrete model names route to model_name")
+
+
+def test_resolve_llm_route_listing_unavailable_falls_back_to_task() -> None:
+    assert fetch_plugin.resolve_llm_route("utils", None) == ("utils", None)
+    assert fetch_plugin.resolve_llm_route("utils", []) == ("utils", None)
+    assert fetch_plugin.resolve_llm_route("", ["utils"]) == (None, None)
+    print("ok: missing task list falls back to task_name")
+
+
+def _fetch_llm_plugin(configured: str, tasks: list[str] | None):
+    from types import SimpleNamespace
+
+    captured: list[dict[str, object]] = []
+
+    async def generate(**kwargs: object) -> dict[str, object]:
+        captured.append(dict(kwargs))
+        return {"success": True, "response": "ok"}
+
+    async def get_available_models() -> list[str]:
+        if tasks is None:
+            raise RuntimeError("listing failed")
+        return list(tasks)
+
+    inst = fetch_plugin.create_plugin()
+    inst._set_context(
+        SimpleNamespace(
+            logger=SimpleNamespace(warning=lambda *_a, **_k: None),
+            llm=SimpleNamespace(generate=generate, get_available_models=get_available_models),
+        )
+    )
+    return inst, captured
+
+
+def test_llm_generate_uses_task_name_not_model() -> None:
+    import asyncio
+
+    inst, captured = _fetch_llm_plugin("utils", ["utils", "planner", "replyer"])
+    asyncio.run(inst._llm_generate("hi", "utils", timeout_ms=1000))
+    kwargs = captured[0]
+    assert kwargs.get("task_name") == "utils"
+    assert "model" not in kwargs
+    assert "model_name" not in kwargs
+    print("ok: fetch-url LLM uses task_name, not model")
+
+
+def test_llm_generate_uses_model_name_for_concrete_model() -> None:
+    import asyncio
+
+    inst, captured = _fetch_llm_plugin("step-5-preview", ["utils", "planner", "replyer"])
+    asyncio.run(inst._llm_generate("hi", "step-5-preview"))
+    kwargs = captured[0]
+    assert kwargs.get("model_name") == "step-5-preview"
+    assert "task_name" not in kwargs
+    assert "model" not in kwargs
+    print("ok: fetch-url LLM uses model_name for concrete models")
+
+
+def test_llm_generate_listing_failure_keeps_task_name() -> None:
+    import asyncio
+
+    inst, captured = _fetch_llm_plugin("utils", None)
+    asyncio.run(inst._llm_generate("hi", "utils"))
+    assert captured[0].get("task_name") == "utils"
+    assert "model_name" not in captured[0]
+    print("ok: fetch-url LLM keeps task_name when listing fails")
+
+
 def main() -> None:
     import tempfile
 
@@ -812,6 +888,12 @@ def main() -> None:
     test_fetch_url_entries_wire_image_defaults()
     test_api_image_describe_and_metadata_only()
     test_fetch_url_impl_respects_return_image_flag()
+    test_resolve_llm_route_prefers_task_names()
+    test_resolve_llm_route_uses_model_name_when_not_a_task()
+    test_resolve_llm_route_listing_unavailable_falls_back_to_task()
+    test_llm_generate_uses_task_name_not_model()
+    test_llm_generate_uses_model_name_for_concrete_model()
+    test_llm_generate_listing_failure_keeps_task_name()
     test_plugin_importable()
     test_normalize_omits_none_for_toml_persist()
     test_webui_blank_optional_scalars_normalize()
