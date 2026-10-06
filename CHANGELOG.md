@@ -5,6 +5,12 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.4.2] - 2026-10-06
+
+### 修复
+
+- `fetch_url` 工具、公开 API 与 LRS `invoke_procedure` 声明 Host RPC 超时（默认 195 秒）。未声明时 Host 对 `plugin.invoke_tool` 只等 60 秒；jina 超时回退后再做 LLM 总结会被掐成 `[E_TIMEOUT]`
+
 ## [0.4.1] - 2026-09-20
 
 ### 修复

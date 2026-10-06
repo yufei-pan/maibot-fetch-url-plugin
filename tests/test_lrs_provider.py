@@ -24,6 +24,7 @@ def test_lrs_provider_apis_registered() -> None:
     assert describe["metadata"]["lunagentic_contract"] == "1"
     assert invoke["metadata"]["public"] is True
     assert invoke["metadata"]["version"] == "1"
+    assert invoke["metadata"]["timeout_ms"] == fetch_plugin.DEFAULT_INVOKE_TIMEOUT_MS
 
 
 def test_descriptor_contract() -> None:
@@ -59,7 +60,7 @@ def test_descriptor_contract() -> None:
             },
             "result_schema": {"type": "object"},
             "idempotent": True,
-            "timeout_seconds": 120,
+            "timeout_seconds": fetch_plugin.DEFAULT_INVOKE_TIMEOUT_MS // 1000,
             "external_cost_kind": "provider_metered",
             "enabled": True,
         }

@@ -196,6 +196,7 @@ def test_get_components_planner_visibility() -> None:
     )
     assert not fetch_off["metadata"].get("core_tool")
     assert fetch_off["metadata"].get("visibility") != "visible"
+    assert fetch_off["metadata"].get("timeout_ms") == fetch_plugin.DEFAULT_INVOKE_TIMEOUT_MS
 
     instance._always_visible_for_planner = True
     components_on = instance.get_components()
@@ -218,6 +219,7 @@ def test_api_fetch_url_component_registered() -> None:
     assert api["metadata"].get("public") is True
     assert api["metadata"].get("version") == "1"
     assert api["metadata"].get("handler_name") == "api_fetch_url"
+    assert api["metadata"].get("timeout_ms") == fetch_plugin.DEFAULT_INVOKE_TIMEOUT_MS
     print("ok: API fetch_url registered public=True")
 
 
@@ -240,6 +242,7 @@ def test_lrs_procedure_provider_apis_registered() -> None:
     assert describe["metadata"].get("lunagentic_contract") == "1"
     assert invoke["metadata"].get("public") is True
     assert invoke["metadata"].get("version") == "1"
+    assert invoke["metadata"].get("timeout_ms") == fetch_plugin.DEFAULT_INVOKE_TIMEOUT_MS
 
     async def run() -> None:
         envelope = await instance.describe_procedures()

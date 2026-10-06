@@ -1039,6 +1039,14 @@ DEFAULT_LLM_MODEL = "planner"
 DEFAULT_LLM_TEMPERATURE = 0.3
 DEFAULT_LLM_MAX_TOKENS = 0
 DEFAULT_LLM_RPC_TIMEOUT_MS = 120_000  # llm.generate 的 cap.call RPC 超时（毫秒）；Host 默认仅 30s
+# Host 对未声明 timeout_ms 的 plugin.invoke_tool / API 只等 60s。
+# 本工具最坏路径串行消耗 jina 超时、本地抓取、一次 LLM 总结，再留 30s 余量。
+_INVOKE_TIMEOUT_SLACK_MS = 30_000
+DEFAULT_INVOKE_TIMEOUT_MS = (
+    int((DEFAULT_JINA_TIMEOUT + DEFAULT_FETCH_TIMEOUT) * 1000)
+    + DEFAULT_LLM_RPC_TIMEOUT_MS
+    + _INVOKE_TIMEOUT_SLACK_MS
+)
 DEFAULT_ALT_MAX_IMAGES = 0
 DEFAULT_ALT_MIN_DIMENSION = 128
 DEFAULT_ALT_MODEL = "vlm"
@@ -1915,7 +1923,7 @@ FETCH_PROCEDURE_DEFINITION: dict[str, Any] = {
     },
     "result_schema": {"type": "object"},
     "idempotent": True,
-    "timeout_seconds": 120,
+    "timeout_seconds": DEFAULT_INVOKE_TIMEOUT_MS // 1000,
     "external_cost_kind": "provider_metered",
     "enabled": True,
 }
@@ -2791,6 +2799,7 @@ class FetchUrlPlugin(MaiBotPlugin):
                 default="",
             ),
         ],
+        timeout_ms=DEFAULT_INVOKE_TIMEOUT_MS,
     )
     async def fetch_url(
         self,
@@ -2816,6 +2825,7 @@ class FetchUrlPlugin(MaiBotPlugin):
         description="抓取 URL 并返回内容（供其他插件调用；图片默认返回文字描述）",
         version="1",
         public=True,
+        timeout_ms=DEFAULT_INVOKE_TIMEOUT_MS,
     )
     async def api_fetch_url(
         self,
@@ -2856,6 +2866,7 @@ class FetchUrlPlugin(MaiBotPlugin):
         description="按 LRS Procedure contract 调用 Fetch URL",
         version="1",
         public=True,
+        timeout_ms=DEFAULT_INVOKE_TIMEOUT_MS,
     )
     async def invoke_procedure(
         self,

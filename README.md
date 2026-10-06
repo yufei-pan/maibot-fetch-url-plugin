@@ -101,6 +101,7 @@
 | `cache.ttl_seconds`                      | 1800              | 抓取缓存 TTL（秒）                      |
 | `cache.max_entries`                      | 128               | 抓取缓存条目上限                         |
 
+`fetch_url` 向 Host 声明的整次调用超时是 jina 超时 + 本地抓取超时 + 上述 LLM 超时 + 30 秒余量（默认 195 秒）。Host 对未声明超时的工具只等 60 秒。
 
 > **安全提醒**：`fetch.cookies`、`fetch.domain_cookies`、`jina.api_key` 属于敏感信息，请勿提交到版本库。
 > 另外 jina 在转发 Cookie（`X-Set-Cookie`）时会绕过其缓存，请求可能稍慢。
