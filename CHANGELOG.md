@@ -5,6 +5,16 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.4.4] - 2026-10-16
+
+### 修复
+
+- 运行期 `config.toml` 不再入库：带注释的模板改名为 `config.default.toml`，`config.toml` 加入 `.gitignore`，`create_plugin` 在缺少 `config.toml` 时从模板复制一份（已有配置绝不覆盖）。此前 Host/WebUI 改写配置后会与仓库里的 `config.toml` 冲突（Mai-with-u/plugin-repo#809）。经插件市场更新的用户配置会被 Host 保留；用 `git` 安装且改过 `config.toml` 的用户，拉取前请先备份该文件
+
+### 变更
+
+- manifest 兼容上限改为实际验证过的范围：宿主 `max_version` 1.99.99 → **1.3.99**，SDK `max_version` 2.99.99 → **2.14.99**（宿主 1.3.8 + SDK 2.12.0 上实际运行，SDK 2.14.0 上测试通过）。插件仓库审核不再接受「永远兼容」式的上限（Mai-with-u/plugin-repo#809）
+
 ## [0.4.3] - 2026-10-14
 
 ### 变更

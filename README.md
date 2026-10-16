@@ -66,7 +66,7 @@
 
 ## 配置
 
-完整配置项见 [config.toml](config.toml)，均可在 WebUI 中编辑。常用项：
+完整配置项见 [config.default.toml](config.default.toml)（首次加载时复制为运行期 `config.toml`，后者不入库），均可在 WebUI 中编辑。常用项：
 
 
 | 配置项                                      | 默认值               | 说明                             |

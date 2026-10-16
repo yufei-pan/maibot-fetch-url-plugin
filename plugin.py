@@ -17,6 +17,7 @@ import ipaddress
 import json
 import math
 import re
+import shutil
 import time
 from base64 import b64encode
 from collections import OrderedDict
@@ -3335,6 +3336,25 @@ def _safe_int(value: Any, default: int) -> int:
         return default
 
 
+SHIPPED_CONFIG_TEMPLATE_NAME = "config.default.toml"
+
+
+def _ensure_shipped_config_present(plugin_dir: Path) -> bool:
+    """若缺少运行期 ``config.toml``，从 ``config.default.toml`` 复制一份。
+
+    运行期 ``config.toml`` 不入库。Host Runner 在 ``on_load`` 之前读取配置，必须在
+    ``create_plugin`` 阶段落盘带注释、留空字段跟随内置默认的模板，否则 Runner 会写入
+    把全部默认值写死的无注释配置。已有配置绝不覆盖。
+    """
+    config_path = plugin_dir / "config.toml"
+    template_path = plugin_dir / SHIPPED_CONFIG_TEMPLATE_NAME
+    if config_path.exists() or not template_path.exists():
+        return False
+    shutil.copy2(template_path, config_path)
+    return True
+
+
 def create_plugin() -> FetchUrlPlugin:
     """创建插件实例。"""
+    _ensure_shipped_config_present(Path(__file__).resolve().parent)
     return FetchUrlPlugin()

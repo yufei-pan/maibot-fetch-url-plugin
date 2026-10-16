@@ -374,12 +374,24 @@ def test_plugin_importable() -> None:
     assert default_config["alt_text"]["image"]["animated_policy"] is None
     assert "animated_policy" not in default_config["image"]
 
-    config_data = tomllib.loads((PLUGIN_DIR / "config.toml").read_text(encoding="utf-8"))
+    config_data = tomllib.loads((PLUGIN_DIR / "config.default.toml").read_text(encoding="utf-8"))
     for section, fields in config_data.items():
-        assert section in default_config, f"config.toml 中存在未知配置节：{section}"
+        assert section in default_config, f"config.default.toml 中存在未知配置节：{section}"
         for field in fields:
-            assert field in default_config[section], f"config.toml 中存在未知字段：{section}.{field}"
+            assert field in default_config[section], f"config.default.toml 中存在未知字段：{section}.{field}"
     print("ok: plugin importable, config model consistent")
+
+
+def test_shipped_config_template_copied_only_when_missing(tmp_dir: Path) -> None:
+    """运行期 config.toml 不入库：缺失时从 config.default.toml 复制，已有配置绝不覆盖。"""
+    template = (PLUGIN_DIR / "config.default.toml").read_text(encoding="utf-8")
+    (tmp_dir / "config.default.toml").write_text(template, encoding="utf-8")
+    assert fetch_plugin._ensure_shipped_config_present(tmp_dir) is True
+    assert (tmp_dir / "config.toml").read_text(encoding="utf-8") == template
+    (tmp_dir / "config.toml").write_text("[plugin]\nenabled = false\n", encoding="utf-8")
+    assert fetch_plugin._ensure_shipped_config_present(tmp_dir) is False
+    assert (tmp_dir / "config.toml").read_text(encoding="utf-8") == "[plugin]\nenabled = false\n"
+    print("ok: shipped config template copied only when config.toml is missing")
 
 
 def _assert_no_none(value: object, path: str = "$") -> None:
@@ -919,6 +931,8 @@ def main() -> None:
     test_alt_text_regex_and_sanitize()
     with tempfile.TemporaryDirectory(dir=str(PLUGIN_DIR)) as tmp:
         test_alt_text_cache_persistence(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        test_shipped_config_template_copied_only_when_missing(Path(tmp))
     test_private_address_detection()
     test_ssrf_guard()
     test_cookie_matching()

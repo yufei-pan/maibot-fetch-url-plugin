@@ -10,3 +10,6 @@ __pycache__/
 # 本地配置（可能含 Cookie / API Key）
 config.local.toml
 .worktrees/
+
+# 运行期配置：由 config.default.toml 模板在首次加载时生成，不入库（Host/WebUI 会改写它）
+/config.toml
