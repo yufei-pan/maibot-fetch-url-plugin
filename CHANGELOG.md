@@ -5,6 +5,12 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 变更
+
+- SDK 兼容上限 `max_version` 2.14.99 → **2.16.99**：宿主 1.3.14 + SDK 2.16.0 上测试通过（SDK 2.15 / 2.16 只新增能力，无破坏性变更）
+
 ## [0.4.4] - 2026-10-16
 
 ### 修复
